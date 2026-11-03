@@ -82,8 +82,33 @@ H.R. 10453 (119th Congress) is the first test case. It covers:
 # Open Questions
 - How should floor and committee amendments be handled? The filename convention covers bill versions, but amendments offered to a bill aren't bill versions.
 
+# Known problems (for next session)
+Found reviewing the H.R. 10453 output. No wrong edits or citations were found, but the review wasn't a line-by-line check against the bill.
+
+## Output fixes
+- Flags with no inline marker: a flag on a section that isn't reproduced (e.g. Flag 8 on § 1605, where nothing changed) or that isn't tied to a section (e.g. Flag 5 on § 8(1)) appears only in the opening summary.
+- Added text in Code notes: the new subparagraph (B) in the Secure Equipment Act note follows the bill's style, with no opening quotation mark and no ".—" after its heading, unlike the text around it.
+- Summary lists: the verification and flag lists don't show bullet marks.
+
+## Decisions needed
+- § 2(b)(2)(D) wasn't applied, because the § 1709 note already shows "of 2019 (47 U.S.C. 1601(a))" in brackets. Check the enacted text and decide how to treat editorial brackets.
+- "Each place it appears" replacements skip headings, which leaves the § 1604 heading unchanged ("Reports on covered communications equipment or services"). Is that the right reading?
+- The bill's lowercase wording goes into two Title Case headings in § 1709 (e.g. "Evaluation of certain information and communications technology or services for inclusion on Covered List"). Keep the bill's exact wording?
+
+## Not built yet
+Suggested order:
+1. Test against enacted laws, to measure accuracy and show which wording the parser misses. The parser has only been tested on H.R. 10453, and its patterns were built around that bill.
+2. LLM parsing for wording the patterns don't recognize.
+3. Recognizing instructions that move text, so they can appear in the "moved" format.
+
 # Next phase
 - Save a snapshot on each run so a redline can be reproduced later (e.g. source files, parsed edits, retrieval times, hashes).
+
+# Phase 2 ideas
+- Compare bill versions across time (e.g. introduced vs. reported vs. passed).
+
+# Phase 3 ideas
+- Compare bills introduced across Congresses (e.g. a bill reintroduced in a later Congress vs. its earlier version).
 
 # Future work
 - Mac or multisystem support

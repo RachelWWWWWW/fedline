@@ -14,7 +14,7 @@ from fedline.docx_writer import write_docx
 from fedline.bill import Instruction, Target
 from fedline.engine import Engine, _NotApplied, _sentences, _word_matches
 from fedline.sources import SourceError, parse_bill_url
-from fedline.statute import CodeTitle, DEL, INS, Node, Text, credit_origin
+from fedline.statute import CodeTitle, DEL, INS, Node, Text, _strip_ws, credit_origin
 
 FIXTURES = Path(__file__).parent / "fixtures"
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -83,6 +83,35 @@ class FootnoteTests(unittest.TestCase):
         doc = CodeTitle(self.XML).document("352")
         self.assertEqual(doc.root.body.current(), "Under the Act (sec. 1611), all deposits. Then the Secretary acts.")
         self.assertEqual(doc.source_text, "§352.UndertheAct(sec.1611),alldeposits.ThentheSecretaryacts.")
+
+
+class ContinuationTests(unittest.TestCase):
+    """16 U.S.C. 1536(b)(4) has text between subparagraph (C) and clauses (i) and (ii)."""
+    XML = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+           '<section identifier="/us/usc/t16/s1536"><num value="1536">§ 1536.</num><chapeau>If the Secretary '
+           'concludes that—</chapeau><subparagraph><num value="C">(C)</num><content>the taking is authorized;'
+           '</content></subparagraph><continuation>the Secretary shall provide a statement that—</continuation>'
+           '<clause><num value="i">(i)</num><content>specifies the impact, and</content></clause>'
+           '<clause><num value="ii">(ii)</num><content>sets forth terms.</content></clause>'
+           '<continuation>The statement is final.</continuation>'
+           '<sourceCredit>(Pub. L. 93–205, § 7.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def setUp(self):
+        self.doc = CodeTitle(self.XML).document("1536")
+
+    def test_text_between_subdivisions_keeps_its_place(self):
+        root = self.doc.root
+        self.assertEqual([c.kind for c in root.children], ["subparagraph", "continuation", "clause", "clause"])
+        self.assertEqual(root.tail.current(), "The statement is final.")
+        self.assertEqual(_strip_ws(root.before_text()), self.doc.source_text)
+
+    def test_matter_following_a_subdivision_can_be_the_text_between(self):
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace",
+                           args={"old": "Secretary", "new": "Director", "every": False},
+                           within=[("following", "subparagraph", "C")])
+        Engine(SimpleNamespace(), {})._operate(inst, self.doc, self.doc.root)
+        self.assertEqual(marked(self.doc.root.children[1].body),
+                         "the [-Secretary-][+Director+] shall provide a statement that—")
 
 
 class CreditTests(unittest.TestCase):

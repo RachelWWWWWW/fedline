@@ -113,6 +113,12 @@ class Writer:
             lines.append(_Line(pieces, 0 if root else _INDENT.get(node.kind, 0)))
         lines.extend(_Line(flag=f) for f in flags.get(id(node), []))
         for child in node.children:
+            if child.kind == "continuation":
+                # Text between subdivisions lines up with the text that introduced them.
+                text = self._pieces(child.body)
+                if text:
+                    lines.append(_Line(text, 0 if root else _INDENT.get(node.kind, 0)))
+                continue
             self._lines(child, flags, lines)
         tail = self._pieces(node.tail)
         if tail:

@@ -120,6 +120,8 @@ class Node:
 
     def live_child(self, value: str, kind: str | None = None) -> "Node | None":
         for child in self.children:
+            if child.kind == "continuation":
+                continue
             if not child.deleted and child.value == value and (kind is None or child.kind == kind):
                 return child
         return None
@@ -242,9 +244,13 @@ def parse_uslm_node(el: ET.Element) -> Node:
     node = Node(kind=_local(el))
     body_parts: list[str] = []
     tail_parts: list[str] = []
-    for child in el:
+    levels = [i for i, child in enumerate(el) if _local(child) in LEVELS]
+    for i, child in enumerate(el):
         tag = _local(child)
-        if tag == "num":
+        if tag == "continuation" and levels and i < levels[-1]:
+            # Text between subdivisions, as in 16 U.S.C. 1536(b)(4), stays where it is in reading order.
+            node.children.append(Node(kind="continuation", body=Text(_flat(child))))
+        elif tag == "num":
             node.value = child.get("value", "")
             node.label = Text(_flat(child))
         elif tag == "heading":

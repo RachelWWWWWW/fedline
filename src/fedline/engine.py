@@ -331,11 +331,15 @@ class Engine:
             where, kind, value = part
             live = [c for c in node.children if not c.deleted]
             child = node.live_child(value, kind)
-            edge = (live[0] if where == "preceding" else live[-1]) if live else None
-            if child is None or child is not edge:
-                raise _NotApplied(f"Not applied: the matter {where} {kind} ({value}) wasn't found in "
-                                  f"{_describe(node, doc)}.", doc, node)
-            text = node.body if where == "preceding" else node.tail
+            after = live[live.index(child) + 1] if child in live[:-1] else None
+            if where == "following" and after is not None and after.kind == "continuation":
+                text = after.body  # matter between subdivisions
+            else:
+                edge = (live[0] if where == "preceding" else live[-1]) if live else None
+                if child is None or child is not edge:
+                    raise _NotApplied(f"Not applied: the matter {where} {kind} ({value}) wasn't found in "
+                                      f"{_describe(node, doc)}.", doc, node)
+                text = node.body if where == "preceding" else node.tail
             if not text.current():
                 raise _NotApplied(f"Not applied: {_describe(node, doc)} has no text {where} {kind} ({value}).",
                                   doc, node)
@@ -618,7 +622,7 @@ class Engine:
     def _check_duplicates(self, inst, doc, node) -> None:
         seen: set[tuple[str, str]] = set()
         for child in node.children:
-            if child.deleted:
+            if child.deleted or child.kind == "continuation":
                 continue
             key = (child.kind, child.value)
             if key in seen and (id(node), key) not in self.duplicates:

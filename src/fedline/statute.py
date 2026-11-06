@@ -126,6 +126,15 @@ class Node:
         for child in self.children:
             child.delete(source)
 
+    def rewrite(self, new: "Node", source: str) -> None:
+        """Amend to read as new: strike everything but the designation and insert new's text in its place."""
+        for old, added in ((self.heading, new.heading), (self.body, new.body), (self.tail, new.tail)):
+            old.delete_all(source)
+            old.segments += added.segments
+        for child in self.children:
+            child.delete(source)
+        self.children += new.children
+
     def renumber(self, value: str, source: str) -> None:
         current = self.label.current()
         match = re.search(rf"\({re.escape(self.value)}\)|\b{re.escape(self.value)}\b", current)

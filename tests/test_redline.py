@@ -7,12 +7,12 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from fedline.bill import _designators
+from fedline.bill import _designators, parse_bill
 from fedline.cli import redline
 from fedline.docx_writer import write_docx
 from fedline.engine import _word_matches
 from fedline.sources import SourceError, parse_bill_url
-from fedline.statute import CodeTitle, DEL, INS, Text, credit_origin
+from fedline.statute import CodeTitle, DEL, INS, Node, Text, credit_origin
 
 FIXTURES = Path(__file__).parent / "fixtures"
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -102,6 +102,50 @@ class DesignatorTests(unittest.TestCase):
     def test_ranges_it_cannot_expand_are_refused(self):
         self.assertIsNone(_designators("(aa) through (cc)", "item"))
         self.assertIsNone(_designators("(5A) through (7)", "paragraph"))
+
+
+def parse_sections(sections_xml: str):
+    return parse_bill(f"<bill><legis-body>{sections_xml}</legis-body></bill>".encode())
+
+
+class ParserTests(unittest.TestCase):
+    def test_lead_in_locators_apply_to_nested_instructions(self):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended, in subsection (a)—"
+            "</text><paragraph><enum>(1)</enum><text>by striking <quote>x</quote> and inserting <quote>y</quote>;"
+            "</text></paragraph><paragraph><enum>(2)</enum><text>in paragraph (1) (as so designated), by striking "
+            "<quote>p</quote> and inserting <quote>q</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual([i.path for i in bill.instructions],
+                         [[("subsection", "a")], [("subsection", "a"), ("paragraph", "1")]])
+
+    def test_lead_in_comma_before_the_action(self):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended, in subsection (b), "
+            "by striking <quote>x</quote> and inserting <quote>y</quote>.</text></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual(bill.instructions[0].path, [("subsection", "b")])
+
+    def test_amended_to_read_as_follows(self):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 6 of the Foo Act (42 U.S.C. 101) is amended to read as follows:"
+            "</text><quoted-block><section><enum>6.</enum><header>New heading</header><text>New text.</text>"
+            "</section></quoted-block></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual(bill.instructions[0].action, "rewrite")
+
+
+class RewriteTests(unittest.TestCase):
+    def test_rewrite_keeps_the_designation_and_replaces_the_rest(self):
+        old = Node("section", "4336c", label=Text("§ 4336c."), heading=Text("Old"), body=Text("Old text."),
+                   children=[Node("subsection", "a", label=Text("(a)"), body=Text("Gone."))])
+        new = Node("section", "108", label=Text("Sec. 108.", INS), heading=Text("New", INS),
+                   body=Text("New text.", INS))
+        old.rewrite(new, "§ 9")
+        self.assertEqual(old.label.current(), "§ 4336c.")
+        self.assertEqual((old.heading.current(), old.body.current()), ("New", "New text."))
+        self.assertTrue(old.children[0].deleted)
+        self.assertEqual(old.before_text(), "§ 4336c.OldOld text.(a)Gone.")
 
 
 class UrlTests(unittest.TestCase):

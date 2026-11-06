@@ -213,6 +213,15 @@ class Engine:
             node.children[position:position] = args["blocks"]
             self._check_duplicates(inst, doc, node)
             return True
+        if action == "rewrite":
+            block = args["blocks"][0]
+            # A Code section's root carries its Code number, not the Act's, so only its kind can be compared.
+            if block.kind != node.kind or (node is not doc.root and block.value != node.value):
+                raise _NotApplied(f"Not applied: the replacement is {block.kind} ({block.value}), but it replaces "
+                                  f"{_describe(node, doc)}.", doc, node)
+            node.rewrite(block, inst.cite)
+            self._check_duplicates(inst, doc, node)
+            return True
         if action == "add_at_end":
             node.children.extend(args["blocks"])
             self._check_duplicates(inst, doc, node)

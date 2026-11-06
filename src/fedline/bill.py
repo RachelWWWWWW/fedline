@@ -146,7 +146,7 @@ def _parse_target(match: re.Match) -> Target | None:
 
 
 _LEVEL_WORDS = {f"{word}s": word for word in LEVELS} | {word: word for word in LEVELS}
-_AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|added|amended)[^)]*\)")
+_AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|designated|added|amended)[^)]*\)")
 
 
 def _roman(n: int) -> str:
@@ -289,6 +289,10 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
         if old and new:
             return "redesignate", {"kind": kind, "old": old, "new": new}
 
+    match = re.fullmatch(r"to read as follows:?", text)
+    if match and len(blocks) == 1:
+        return "rewrite", {"blocks": blocks}
+
     match = re.fullmatch(r"by adding at the end the following:?", text)
     if match and blocks:
         return "add_at_end", {"blocks": blocks}
@@ -392,11 +396,13 @@ class _Parser:
         if target is None:
             self.bill.problems.append(ParseProblem(_cite(cite), text, "couldn't resolve the citation for the law being amended"))
             return
-        rest = match.group("rest").strip()
-        if rest.startswith("—") or not rest:
-            for child in el:
-                if child.tag in _PARTS:
-                    self.instruction(child, target, [], cite + [_enum(child)])
+        # "is amended—", "is amended, in subsection (a)—" or "is amended, in subsection (a), by …"
+        rest = match.group("rest").strip().removeprefix(",").strip()
+        located, _, remainder = _parse_locators(rest)
+        children = [c for c in el if c.tag in _PARTS]
+        if remainder in ("", "—") and children:
+            for child in children:
+                self.instruction(child, target, located, cite + [_enum(child)])
             return
         self.leaf(el, rest, quotes, target, [], cite, False)
 

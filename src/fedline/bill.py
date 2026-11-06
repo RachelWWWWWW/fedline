@@ -271,6 +271,12 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
         return "replace", {"old": q(match, "a"), "new": new_text(match),
                            "every": bool(match.group("every")), "except": match.group("ex")}
 
+    match = re.fullmatch(r"by striking ⟦(?P<a>\d+)⟧ and inserting the following:?(?: ⟦(?P<b>\d+)⟧)?", text)
+    if match and match.group("b") and not blocks:
+        return "replace", {"old": q(match, "a"), "new": q(match, "b"), "every": False, "except": None}
+    if match and blocks and not match.group("b"):
+        return "replace_with_block", {"old": q(match, "a"), "blocks": blocks}
+
     match = re.fullmatch(
         rf"by striking (?:⟦(?P<a>\d+)⟧|the (?P<pa>{punct}))(?: after the (?P<after>{punct}))? at the end"
         rf"(?: and inserting {new})?", text)

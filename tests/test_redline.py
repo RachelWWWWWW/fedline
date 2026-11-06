@@ -312,9 +312,65 @@ class MatterTests(unittest.TestCase):
         with self.assertRaises(_NotApplied):
             self.apply([("following", "subparagraph", "A")], old="Secretary", new="Administrator")
 
-    def test_sentences_need_a_single_block(self):
+    def test_with_subdivisions_sentences_count_only_within_the_introductory_text(self):
+        self.apply([("sentence", 1)], old="Secretary", new="Administrator")
+        self.assertEqual(marked(self.node.body), "The [-Secretary-][+Administrator+] shall—")
         with self.assertRaises(_NotApplied):
-            self.apply([("sentence", 1)], old="Secretary", new="Administrator")
+            self.apply([("sentence", 2)], old="Secretary", new="Administrator")
+
+
+def new_node(kind, value, heading="", body="", children=()):
+    return Node(kind, value, label=Text(f"({value})", INS), heading=Text(heading, INS), body=Text(body, INS),
+                children=list(children))
+
+
+class BlockTests(unittest.TestCase):
+    def apply(self, node, old, blocks, within=()):
+        doc = SimpleNamespace(title="Test", root=node)
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                           args={"old": old, "blocks": blocks}, within=list(within))
+        Engine(SimpleNamespace(), {})._operate(inst, doc, node)
+
+    def test_splitting_text_into_new_subdivisions_keeps_the_original_text(self):
+        node = Node("subsection", "b", label=Text("(b)"), body=Text("The fee is due. The location fee is $5."))
+        self.apply(node, "The location fee", [new_node("paragraph", "2", "Fee", "The location fee")], [("sentence", 2)])
+        self.apply(node, "The fee", [new_node("paragraph", "1", "In general", "The fee")], [("sentence", 1)])
+        self.assertEqual(marked(node.body), "[-The fee-]")
+        first, second = node.children
+        self.assertEqual(marked(first.body), "[+The fee+] is due. [-The location fee-]")
+        self.assertEqual(marked(second.body), "[+The location fee+] is $5.")
+        self.assertEqual(node.before_text(), "(b)The fee is due. The location fee is $5.")
+
+    def test_existing_subdivisions_block_a_split(self):
+        node = Node("paragraph", "1", label=Text("(1)"), body=Text("The Secretary shall—"),
+                    children=[Node("subparagraph", "A", label=Text("(A)"), body=Text("act."))])
+        with self.assertRaises(_NotApplied):
+            self.apply(node, "The Secretary", [new_node("subparagraph", "A", "In general", "The Secretary")])
+
+    def test_restructuring_in_place_follows_designations_down(self):
+        node = Node("subsection", "e", label=Text("(e)"), heading=Text("General permits"), children=[
+            Node("paragraph", "1", label=Text("(1)"), body=Text("In carrying out his functions, the Secretary"))])
+        block = new_node("subsection", "e", "General permits", children=[
+            new_node("paragraph", "1", "Permits authorized", "In carrying")])
+        self.apply(node, "(e)(1) In carrying", [block])
+        self.assertEqual(marked(node.heading), "General permits")
+        paragraph = node.children[0]
+        self.assertEqual(marked(paragraph.heading), "[+Permits authorized+]")
+        self.assertEqual(marked(paragraph.body), "In carrying out his functions, the Secretary")
+
+    def test_restructuring_in_place_adds_a_level(self):
+        node = Node("subsection", "c", label=Text("(c)"), heading=Text("Denial"), body=Text("The Administrator may act."))
+        block = new_node("subsection", "c", "Specification", children=[
+            new_node("paragraph", "1", "In general", "The Administrator")])
+        self.apply(node, "(c) The Administrator", [block])
+        self.assertEqual(marked(node.heading), "[-Denial-][+Specification+]")
+        self.assertEqual(marked(node.body), "[-The Administrator-]")
+        self.assertEqual(marked(node.children[0].body), "[+The Administrator+] may act.")
+
+    def test_mismatched_designation_is_refused(self):
+        node = Node("subsection", "t", label=Text("(t)"), body=Text("Nothing in this section"))
+        with self.assertRaises(_NotApplied):
+            self.apply(node, "(t) Nothing in this section", [new_node("subsection", "u", "Savings", "Nothing")])
 
 
 class RewriteTests(unittest.TestCase):

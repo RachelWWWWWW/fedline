@@ -84,6 +84,13 @@ class Text:
         carried = self.strike(start, end, source)
         self.insert(start, text, carried + (source,))
 
+    def cut(self, pos: int) -> "Text":
+        """Split off and return the text from a current-text offset to the end."""
+        i = self._split_at(pos)
+        rest = Text()
+        rest.segments, self.segments = self.segments[i:], self.segments[:i]
+        return rest
+
     def delete_all(self, source: str) -> None:
         """Delete everything. Earlier edits to this text are moot, so only this source is cited."""
         self.strike(0, len(self.current()), source)

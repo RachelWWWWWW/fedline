@@ -286,6 +286,8 @@ class Engine:
             node.children[position:position] = args["blocks"]
             self._check_duplicates(inst, doc, node)
             return True
+        if action == "replace_with_block":
+            return self._replace_with_block(inst, doc, node)
         if action == "rewrite":
             block = args["blocks"][0]
             # A Code section's root carries its Code number, not the Act's, so only its kind can be compared.
@@ -324,10 +326,7 @@ class Engine:
         windows = [(t, 0, len(t.current())) for t in node.texts(headings=False) if t.current()]
         for part in inst.within:
             if part[0] == "sentence":
-                if len(windows) != 1:
-                    raise _NotApplied(f"Not applied: {_describe(node, doc)} has subdivisions, so it isn't clear "
-                                      "which text the sentence count starts from.", doc, node)
-                windows = [self._sentence(windows[0], part[1], doc, node)]
+                windows = [self._sentence(self._sentence_base(windows, part[1], doc, node), part[1], doc, node)]
                 continue
             where, kind, value = part
             live = [c for c in node.children if not c.deleted]
@@ -342,6 +341,17 @@ class Engine:
                                   doc, node)
             windows = [(text, 0, len(text.current()))]
         return windows
+
+    def _sentence_base(self, windows, n, doc, node) -> tuple[Text, int, int]:
+        """The window that sentence n is counted in. With subdivisions, that's the introductory text, which
+        comes first, so it's only clear when the count stays within it."""
+        if len(windows) == 1:
+            return windows[0]
+        body = node.body.current()
+        if n > 0 and body and len(_sentences(body)) >= n:
+            return (node.body, 0, len(body))
+        raise _NotApplied(f"Not applied: {_describe(node, doc)} has subdivisions, so it isn't clear which text "
+                          "the sentence count starts from.", doc, node)
 
     def _sentence(self, window, n, doc, node) -> tuple[Text, int, int]:
         text, start, end = window
@@ -446,13 +456,83 @@ class Engine:
         _swap(text, match.start(), stop, new, inst.cite)
         return True
 
+    def _replace_with_block(self, inst, doc, node) -> bool:
+        """'By striking "X" and inserting the following:' with new subdivisions. Bills use this to break
+        existing text into subdivisions: the struck text is replaced by the new ones, and the text that
+        followed it continues as the text of the last of them."""
+        old, blocks = inst.args["old"], inst.args["blocks"]
+        if not old.startswith("("):
+            self._split_into(inst, doc, node, old, blocks, at_start=False)
+            return True
+        # Struck text that begins with a designation, as in "(e)(1) In carrying", restructures that
+        # provision in place, adding headings and new levels under it.
+        if len(blocks) != 1:
+            raise _NotApplied("Not applied: the struck text starts with a designation, but more than one new "
+                              "provision replaces it.", doc, node)
+        block = blocks[0]
+        target = next((n for n in [node] + [c for c in node.children if not c.deleted]
+                       if (n.kind, n.value) == (block.kind, block.value)), None)
+        if target is None:
+            raise _NotApplied(f"Not applied: the new {block.kind} ({block.value}) doesn't match {_describe(node, doc)} "
+                              "or any of its subdivisions.", doc, node)
+        self._overlay(inst, doc, target, old, block)
+        return True
+
+    def _overlay(self, inst, doc, node, old, block) -> None:
+        label = node.label.current().strip()
+        if not label or not old.startswith(label):
+            raise _NotApplied(f"Not applied: “{old}” doesn't start with the designation of {_describe(node, doc)}.",
+                              doc, node)
+        rest = old[len(label):].lstrip()
+        if block.heading.current() and block.heading.current() != node.heading.current():
+            node.heading.delete_all(inst.cite)
+            node.heading.segments += block.heading.segments
+        live = [c for c in node.children if not c.deleted]
+        if block.children:
+            first = block.children[0]
+            if live and (live[0].kind, live[0].value) == (first.kind, first.value):
+                if len(block.children) != 1:
+                    raise _NotApplied(f"Not applied: the new subdivisions don't line up with those of "
+                                      f"{_describe(node, doc)}.", doc, node)
+                return self._overlay(inst, doc, live[0], rest, first)
+            return self._split_into(inst, doc, node, rest, block.children, at_start=True)
+        if not node.body.current().startswith(rest):
+            raise _NotApplied(f"Not applied: the text of {_describe(node, doc)} doesn't start with “{rest}”.",
+                              doc, node)
+        if block.body.current() != rest:
+            _swap(node.body, 0, len(rest), block.body.current(), inst.cite)
+
+    def _split_into(self, inst, doc, node, old, blocks, at_start) -> None:
+        """Strike old from node's introductory text and put blocks in its place as new subdivisions, moving
+        the text that followed old into the last of them."""
+        if any(c.label.before() for c in node.children if not c.deleted):
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} already has subdivisions, and the instruction "
+                              "doesn't say whether they move under the new ones.", doc, node)
+        if any(b.kind == node.kind for b in blocks):
+            raise _NotApplied(f"Not applied: the new {blocks[0].kind} can't go inside {_describe(node, doc)}.",
+                              doc, node)
+        text = node.body
+        windows = [w for w in self._scope(inst, doc, node) if w[0] is text]
+        hits = self._hits(old, windows)
+        if at_start:
+            hits = [(t, m) for t, m in hits if m.start() == 0]
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{old}” {problem} in the text of {_describe(node, doc)}.", doc, node)
+        match = hits[0][1]
+        text.strike(match.start(), match.end(), inst.cite)
+        rest = text.cut(match.start())
+        last = blocks[-1]
+        while last.children:
+            last = last.children[-1]
+        last.body.segments += rest.segments
+        node.children[0:0] = blocks
+        self._check_duplicates(inst, doc, node)
+
     def _edit_sentence(self, inst, doc, node) -> bool:
         """'By striking the second sentence', 'by inserting after the first sentence the following: "…"'."""
-        windows = self._scope(inst, doc, node)
-        if len(windows) != 1:
-            raise _NotApplied(f"Not applied: {_describe(node, doc)} has subdivisions, so it isn't clear which "
-                              "text the sentence count starts from.", doc, node)
-        text, start, end = self._sentence(windows[0], inst.args["n"], doc, node)
+        n = inst.args["n"]
+        text, start, end = self._sentence(self._sentence_base(self._scope(inst, doc, node), n, doc, node), n, doc, node)
         new = inst.args["new"]
         if inst.action == "insert_after_sentence":
             text.insert(end, f" {new}", (inst.cite,))

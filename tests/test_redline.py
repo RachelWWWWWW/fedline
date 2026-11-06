@@ -12,7 +12,7 @@ from fedline.bill import _designators, parse_bill
 from fedline.cli import redline
 from fedline.docx_writer import write_docx
 from fedline.bill import Instruction, Target
-from fedline.engine import Engine, _NotApplied, _word_matches
+from fedline.engine import Engine, _NotApplied, _sentences, _word_matches
 from fedline.sources import SourceError, parse_bill_url
 from fedline.statute import CodeTitle, DEL, INS, Node, Text, credit_origin
 
@@ -150,6 +150,20 @@ class ParserTests(unittest.TestCase):
                                 "and inserting <quote>B.</quote>."),
                          ("replace_span", {"start": "A", "end": None, "end_punct": ".", "new": "B."}))
 
+    def test_within_locators(self):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended—</text>"
+            "<paragraph><enum>(1)</enum><text>in the matter preceding paragraph (1), in the second sentence—</text>"
+            "<subparagraph><enum>(A)</enum><text>by striking <quote>x</quote> and inserting <quote>y</quote>; and"
+            "</text></subparagraph></paragraph><paragraph><enum>(2)</enum><text>in subsection (b), in the "
+            "undesignated matter following clause (v), by striking the last sentence.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        first, second = bill.instructions
+        self.assertEqual(first.within, [("preceding", "paragraph", "1"), ("sentence", 2)])
+        self.assertEqual((second.path, second.within, second.action, second.args),
+                         ([("subsection", "b")], [("following", "clause", "v")], "replace_sentence",
+                          {"n": -1, "new": ""}))
+
     def test_amended_to_read_as_follows(self):
         bill = parse_sections(
             "<section><enum>2.</enum><text>Section 6 of the Foo Act (42 U.S.C. 101) is amended to read as follows:"
@@ -159,11 +173,11 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(bill.instructions[0].action, "rewrite")
 
 
-def operate(action: str, body: str, **args) -> Text:
+def operate(action: str, body: str, within=(), **args) -> Text:
     """Apply one parsed operation to a section with the given text and return that text."""
     node = Node("section", "1", body=Text(body))
     doc = SimpleNamespace(title="Test § 1", root=node)
-    inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action=action, args=args)
+    inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action=action, args=args, within=list(within))
     Engine(SimpleNamespace(), {})._operate(inst, doc, node)
     return node.body
 
@@ -182,6 +196,10 @@ class TextEditTests(unittest.TestCase):
             operate("replace_at_end", "a door", old="or", new="", after=None)
         with self.assertRaises(_NotApplied):
             operate("replace_at_end", "law, and", old="and", new="", after=";")
+
+    def test_inserted_punctuation_attaches_to_the_anchor(self):
+        self.assertEqual(marked(operate("insert_after", "per site, respectively", anchor="respectively",
+                                        new=", except mill sites")), "per site, respectively[+, except mill sites+]")
 
     def test_punctuation_at_the_end(self):
         self.assertEqual(marked(operate("replace_at_end", "this title.", old=".", new="; and", after=None)),
@@ -225,6 +243,65 @@ class InlineParagraphTests(unittest.TestCase):
     def test_text_edits_to_the_inline_paragraph_itself_are_refused(self):
         with self.assertRaises(_NotApplied):
             self.apply([("subsection", "2")], "replace", old="agencies", new="bodies", every=False)
+
+
+class SentenceTests(unittest.TestCase):
+    TEXT = ("The Secretary may act under 30 U.S.C. 22 et seq. and Pub. L. 109–58. The fee is $100. "
+            "Mr. Smith shall pay it to the U.S. Treasury.")
+
+    def test_splits_only_at_sentence_ends(self):
+        self.assertEqual([self.TEXT[a:b] for a, b in _sentences(self.TEXT)], [
+            "The Secretary may act under 30 U.S.C. 22 et seq. and Pub. L. 109–58.",
+            "The fee is $100.",
+            "Mr. Smith shall pay it to the U.S. Treasury."])
+
+    def test_edits_are_limited_to_the_named_sentence(self):
+        text = "The fee is due. The fee is $100."
+        self.assertEqual(marked(operate("replace", text, [("sentence", 2)], old="fee", new="charge", every=False)),
+                         "The fee is due. The [-fee-][+charge+] is $100.")
+        with self.assertRaises(_NotApplied):
+            operate("replace", text, [("sentence", 3)], old="fee", new="charge", every=False)
+
+    def test_period_at_the_end_of_a_sentence(self):
+        text = "Lands under the Act (36 Stat. 961). Secretary means the Secretary."
+        self.assertEqual(marked(operate("replace_span", text, [("sentence", 1)], start="(36 Stat.", end=None,
+                                        end_punct=".", new="(16 U.S.C. 552).")),
+                         "Lands under the Act [-(36 Stat. 961).-][+(16 U.S.C. 552).+] Secretary means the Secretary.")
+
+    def test_strike_and_insert_after_a_sentence(self):
+        text = "One. Two. Three."
+        self.assertEqual(marked(operate("replace_sentence", text, n=2, new="")), "One.[- Two.-] Three.")
+        self.assertEqual(marked(operate("insert_after_sentence", text, n=1, new="New.")), "One.[+ New.+] Two. Three.")
+
+
+class MatterTests(unittest.TestCase):
+    def setUp(self):
+        self.node = Node("paragraph", "1", body=Text("The Secretary shall—"),
+                         children=[Node("subparagraph", "A", body=Text("act; and")),
+                                   Node("subparagraph", "B", body=Text("report,"))],
+                         tail=Text("as the Secretary determines."))
+        self.doc = SimpleNamespace(title="Test", root=self.node)
+
+    def apply(self, within, **args):
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace",
+                           args={"every": False, **args}, within=within)
+        Engine(SimpleNamespace(), {})._operate(inst, self.doc, self.node)
+
+    def test_matter_preceding_and_following(self):
+        self.apply([("preceding", "subparagraph", "A")], old="Secretary", new="Administrator")
+        self.apply([("following", "subparagraph", "B")], old="Secretary", new="Administrator")
+        self.assertEqual(marked(self.node.body), "The [-Secretary-][+Administrator+] shall—")
+        self.assertEqual(marked(self.node.tail), "as the [-Secretary-][+Administrator+] determines.")
+
+    def test_matter_must_be_next_to_the_named_subdivision(self):
+        with self.assertRaises(_NotApplied):
+            self.apply([("preceding", "subparagraph", "B")], old="Secretary", new="Administrator")
+        with self.assertRaises(_NotApplied):
+            self.apply([("following", "subparagraph", "A")], old="Secretary", new="Administrator")
+
+    def test_sentences_need_a_single_block(self):
+        with self.assertRaises(_NotApplied):
+            self.apply([("sentence", 1)], old="Secretary", new="Administrator")
 
 
 class RewriteTests(unittest.TestCase):

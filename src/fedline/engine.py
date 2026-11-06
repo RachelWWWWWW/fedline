@@ -59,6 +59,32 @@ def _ends_with_inline(node: Node, value: str) -> bool:
     return bool(inline) and inline[-1] == value and text.endswith("—") and bool(node.children)
 
 
+# Words that end in a period without ending a sentence. Words with a period inside, like "U.S.C", are
+# recognized separately.
+_ABBREVIATIONS = {"Stat", "Pub", "No", "Nos", "Sec", "Secs", "sec", "secs", "Inc", "Co", "Corp", "Ltd", "Jr", "Sr",
+                  "Dr", "Mr", "Mrs", "Ms", "St", "seq", "etc", "al", "v", "ch", "pt", "div", "subch", "cl", "par",
+                  "Jan", "Feb", "Mar", "Apr", "Aug", "Sept", "Oct", "Nov", "Dec"}
+
+
+def _sentences(text: str) -> list[tuple[int, int]]:
+    """Spans of the sentences in text, splitting only where a period is followed by a capitalized word."""
+    spans = []
+    start = 0
+    for match in re.finditer(r"[.?!][”’)]*(\s+)(?=[“‘(]?[A-Z])", text):
+        word = re.search(r"[\w.]*$", text[start:match.start()]).group(0)
+        if "." in word or word in _ABBREVIATIONS or (len(word) == 1 and word.isupper()):
+            continue
+        spans.append((start, match.start(1)))
+        start = match.end()
+    spans.append((start, len(text.rstrip())))
+    return spans
+
+
+def _ordinal(n: int) -> str:
+    return {-1: "last"}.get(n) or ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+                                   "ninth", "tenth"][n - 1]
+
+
 def _swap(text: Text, start: int, end: int, new: str, source: str) -> None:
     """Replace a range. A pure deletion takes one neighboring space with it, so no double space is left."""
     if new:
@@ -244,6 +270,8 @@ class Engine:
             return self._replace_at_end(inst, doc, node)
         if action == "replace_span":
             return self._replace_span(inst, doc, node)
+        if action in ("replace_sentence", "insert_after_sentence"):
+            return self._edit_sentence(inst, doc, node)
         if action == "delete_nodes":
             for child in self._children(inst, doc, node, args["values"], args["kind"]):
                 child.delete(inst.cite)
@@ -289,17 +317,47 @@ class Engine:
             found.append(child)
         return found
 
-    def _scope(self, inst: Instruction, node: Node) -> list[Text]:
+    def _scope(self, inst: Instruction, doc: Document, node: Node) -> list[tuple[Text, int, int]]:
+        """The text an instruction may edit, as (text, start, end) windows into blocks of text."""
         if inst.heading:
-            return [node.heading]
-        return [t for t in node.texts(headings=False) if t.current()]
+            return [(node.heading, 0, len(node.heading.current()))]
+        windows = [(t, 0, len(t.current())) for t in node.texts(headings=False) if t.current()]
+        for part in inst.within:
+            if part[0] == "sentence":
+                if len(windows) != 1:
+                    raise _NotApplied(f"Not applied: {_describe(node, doc)} has subdivisions, so it isn't clear "
+                                      "which text the sentence count starts from.", doc, node)
+                windows = [self._sentence(windows[0], part[1], doc, node)]
+                continue
+            where, kind, value = part
+            live = [c for c in node.children if not c.deleted]
+            child = node.live_child(value, kind)
+            edge = (live[0] if where == "preceding" else live[-1]) if live else None
+            if child is None or child is not edge:
+                raise _NotApplied(f"Not applied: the matter {where} {kind} ({value}) wasn't found in "
+                                  f"{_describe(node, doc)}.", doc, node)
+            text = node.body if where == "preceding" else node.tail
+            if not text.current():
+                raise _NotApplied(f"Not applied: {_describe(node, doc)} has no text {where} {kind} ({value}).",
+                                  doc, node)
+            windows = [(text, 0, len(text.current()))]
+        return windows
+
+    def _sentence(self, window, n, doc, node) -> tuple[Text, int, int]:
+        text, start, end = window
+        spans = [(start + a, start + b) for a, b in _sentences(text.current()[start:end])]
+        if n > len(spans) or (n == -1 and len(spans) < 2):
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't have a {_ordinal(n)} sentence "
+                              f"(it has {len(spans)}).", doc, node)
+        return (text, *spans[n - 1 if n > 0 else -1])
+
+    def _hits(self, phrase, windows, ignore_case=False) -> list[tuple[Text, re.Match]]:
+        return [(text, m) for text, start, end in windows for m in _word_matches(phrase, text.current(), ignore_case)
+                if start <= m.start() and m.end() <= end]
 
     def _replace_once(self, inst, doc, node) -> bool:
         old, new = inst.args["old"], inst.args["new"]
-        hits = []
-        ignore_case = inst.heading
-        for text in self._scope(inst, node):
-            hits.extend((text, m) for m in _word_matches(old, text.current(), ignore_case))
+        hits = self._hits(old, self._scope(inst, doc, node), inst.heading)
         if not hits:
             raise _NotApplied(f"Not applied: “{old}” wasn't found in {_describe(node, doc)}. "
                               "The Code's wording may differ from the Act's.", doc, node)
@@ -323,11 +381,10 @@ class Engine:
     def _replace_in_blocks(self, inst, doc, node) -> int:
         """Replace whole-phrase, case-sensitive matches in text but not in headings."""
         old, new = inst.args["old"], inst.args["new"]
-        count = 0
-        for text in self._scope(inst, node):
-            for match in reversed(_word_matches(old, text.current())):
-                _swap(text, match.start(), match.end(), new, inst.cite)
-                count += 1
+        hits = self._hits(old, self._scope(inst, doc, node))
+        for text, match in reversed(hits):
+            _swap(text, match.start(), match.end(), new, inst.cite)
+        count = len(hits)
         if not inst.heading:
             self.global_phrases.append((old, doc, inst.cite))
         return count
@@ -347,6 +404,8 @@ class Engine:
     def _replace_at_end(self, inst, doc, node) -> bool:
         """'By striking "or" at the end', 'the period at the end and inserting "; and"' and the like."""
         old, new, after = inst.args["old"], inst.args["new"], inst.args["after"]
+        if inst.within:
+            raise _NotApplied("Not applied: an edit at the end of only part of a provision isn't supported.", doc, node)
         blocks = [t for t in node.texts(headings=False) if t.current()]
         text = blocks[-1] if blocks else None
         current = text.current().rstrip() if text else ""
@@ -362,33 +421,48 @@ class Engine:
     def _replace_span(self, inst, doc, node) -> bool:
         """'By striking "A" and all that follows through "B"', within one block of text."""
         start, end, new = inst.args["start"], inst.args["end"], inst.args["new"]
-        hits = [(t, m) for t in self._scope(inst, node) for m in _word_matches(start, t.current())]
+        windows = self._scope(inst, doc, node)
+        hits = self._hits(start, windows)
         if len(hits) != 1:
             problem = "wasn't found" if not hits else f"appears {len(hits)} times"
             raise _NotApplied(f"Not applied: “{start}” {problem} in {_describe(node, doc)}.", doc, node)
         text, match = hits[0]
+        limit = next(e for t, s, e in windows if t is text and s <= match.start() and match.end() <= e)
         current = text.current()
         if end is not None:
-            ends = _word_matches(end, current[match.end():])
+            ends = _word_matches(end, current[match.end():limit])
             if not ends:
                 raise _NotApplied(f"Not applied: “{end}” wasn't found after “{start}” in the same block of text "
                                   f"in {_describe(node, doc)}.", doc, node)
             stop = match.end() + ends[0].end()
         else:
+            # "The period at the end" is the end of the window: a sentence, if the instruction names one.
             punct = inst.args["end_punct"]
             blocks = [t for t in node.texts(headings=False) if t.current()]
-            if text is not blocks[-1] or not current.rstrip().endswith(punct):
+            stop = len(current[:limit].rstrip())
+            if (not inst.within and text is not blocks[-1]) or not current[:stop].endswith(punct):
                 raise _NotApplied(f"Not applied: the text from “{start}” to the “{punct}” at the end of "
                                   f"{_describe(node, doc)} spans more than one block.", doc, node)
-            stop = len(current.rstrip())
         _swap(text, match.start(), stop, new, inst.cite)
+        return True
+
+    def _edit_sentence(self, inst, doc, node) -> bool:
+        """'By striking the second sentence', 'by inserting after the first sentence the following: "…"'."""
+        windows = self._scope(inst, doc, node)
+        if len(windows) != 1:
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} has subdivisions, so it isn't clear which "
+                              "text the sentence count starts from.", doc, node)
+        text, start, end = self._sentence(windows[0], inst.args["n"], doc, node)
+        new = inst.args["new"]
+        if inst.action == "insert_after_sentence":
+            text.insert(end, f" {new}", (inst.cite,))
+        else:
+            _swap(text, start, end, new, inst.cite)
         return True
 
     def _insert_text(self, inst, doc, node) -> bool:
         anchor, new = inst.args["anchor"], inst.args["new"]
-        hits = []
-        for text in self._scope(inst, node):
-            hits.extend((text, m) for m in _word_matches(anchor, text.current()))
+        hits = self._hits(anchor, self._scope(inst, doc, node))
         if len(hits) != 1:
             problem = "wasn't found" if not hits else f"appears {len(hits)} times"
             raise _NotApplied(f"Not applied: the anchor “{anchor}” {problem} in {_describe(node, doc)}.", doc, node)
@@ -396,11 +470,13 @@ class Engine:
         if inst.action == "insert_before":
             text.insert(match.start(), f"{new} ", (inst.cite,))
         else:
-            text.insert(match.end(), f" {new}", (inst.cite,))
+            text.insert(match.end(), new if new[0] in ",;:.)" else f" {new}", (inst.cite,))
         return True
 
     def _insert_before_period(self, inst, doc, node) -> bool:
         new = inst.args["new"]
+        if inst.within:
+            raise _NotApplied("Not applied: an edit at the end of only part of a provision isn't supported.", doc, node)
         blocks = [t for t in node.texts(headings=False) if t.current()]
         if not blocks or not blocks[-1].current().endswith("."):
             raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't end with a period.", doc, node)

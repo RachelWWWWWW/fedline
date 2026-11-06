@@ -31,6 +31,9 @@ class Instruction:
     heading: bool = False
     action: str = ""
     args: dict = field(default_factory=dict)
+    # Where in the provision: ("preceding" | "following", kind, value) for the matter before or after
+    # a subdivision, ("sentence", n) for the nth sentence, with -1 for the last.
+    within: list[tuple] = field(default_factory=list)
 
 
 @dataclass
@@ -198,12 +201,28 @@ def _designators(text: str, kind: str) -> list[str] | None:
     return None if pending_range else values
 
 
-def _parse_locators(text: str) -> tuple[list[tuple[str, str]], bool, str]:
-    """Consume leading 'in subsection (a), in the heading,' phrases."""
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7,
+             "eighth": 8, "ninth": 9, "tenth": 10, "last": -1}
+_ORDINAL = "|".join(_ORDINALS)
+
+
+def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool, str]:
+    """Consume leading 'in subsection (a), in the heading, in the first sentence,' phrases."""
     path: list[tuple[str, str]] = []
+    within: list[tuple] = []
     heading = False
     text = _AS_NOTE.sub("", text)
     while True:
+        match = re.match(rf"^in the ({_ORDINAL}) sentence(?:, |—|$)", text)
+        if match:
+            within.append(("sentence", _ORDINALS[match.group(1)]))
+            text = text[match.end():]
+            continue
+        match = re.match(r"^in the (?:undesignated )?matter (preceding|following) (\w+) \((\w+)\)(?:, |—|$)", text)
+        if match and match.group(2) in LEVELS:
+            within.append(match.groups())
+            text = text[match.end():]
+            continue
         match = re.match(r"^in the (?:\w+ )?heading of (\w+) ((?:\(\w+\))+)(?:, |—|$)", text)
         if match:
             path += _path_from(match.group(1), match.group(2))
@@ -225,7 +244,7 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], bool, str]:
             path += _path_from(match.group(1), match.group(2))
             text = text[match.end():]
             continue
-        return path, heading, text
+        return path, within, heading, text
 
 
 def _path_from(kind: str, values: str) -> list[tuple[str, str]]:
@@ -313,6 +332,15 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
         new = _designators(match.group(4), _LEVEL_WORDS[match.group(3)])
         if old and new:
             return "redesignate", {"kind": kind, "old": old, "new": new}
+
+    match = re.fullmatch(
+        rf"by striking the ({_ORDINAL}) sentence(?: and inserting the following:? ⟦(?P<b>\d+)⟧)?", text)
+    if match:
+        return "replace_sentence", {"n": _ORDINALS[match.group(1)], "new": q(match, "b") if match.group("b") else ""}
+
+    match = re.fullmatch(rf"by inserting after the ({_ORDINAL}) sentence the following:? ⟦(?P<b>\d+)⟧", text)
+    if match:
+        return "insert_after_sentence", {"n": _ORDINALS[match.group(1)], "new": q(match, "b")}
 
     match = re.fullmatch(r"to read as follows:?", text)
     if match and len(blocks) == 1:
@@ -423,31 +451,31 @@ class _Parser:
             return
         # "is amended—", "is amended, in subsection (a)—" or "is amended, in subsection (a), by …"
         rest = match.group("rest").strip().removeprefix(",").strip()
-        located, _, remainder = _parse_locators(rest)
+        located, within, _, remainder = _parse_locators(rest)
         children = [c for c in el if c.tag in _PARTS]
         if remainder in ("", "—") and children:
             for child in children:
-                self.instruction(child, target, located, cite + [_enum(child)])
+                self.instruction(child, target, located, within, cite + [_enum(child)])
             return
-        self.leaf(el, rest, quotes, target, [], cite, False)
+        self.leaf(el, rest, quotes, target, [], [], cite, False)
 
-    def instruction(self, el, target, path, cite) -> None:
+    def instruction(self, el, target, path, within, cite) -> None:
         text_el = el.find("text")
         if text_el is None:
             self.bill.problems.append(ParseProblem(_cite(cite), "", "instruction has no text"))
             return
         text, quotes = tokenize(text_el)
-        located, heading, rest = _parse_locators(text)
+        located, more_within, heading, rest = _parse_locators(text)
         children = [c for c in el if c.tag in _PARTS]
         if not rest and children:
             for child in children:
-                self.instruction(child, target, path + located, cite + [_enum(child)])
+                self.instruction(child, target, path + located, within + more_within, cite + [_enum(child)])
             return
-        self.leaf(el, rest, quotes, target, path + located, cite, heading, raw=text)
+        self.leaf(el, rest, quotes, target, path + located, within + more_within, cite, heading, raw=text)
 
-    def leaf(self, el, rest, quotes, target, path, cite, heading, raw=None) -> None:
+    def leaf(self, el, rest, quotes, target, path, within, cite, heading, raw=None) -> None:
         cite_text = _cite(cite)
-        located, more_heading, rest = _parse_locators(rest.strip())
+        located, more_within, more_heading, rest = _parse_locators(rest.strip())
         parsed = _parse_action(rest, quotes, _block_nodes(el, cite_text))
         full = raw or rest
         for i, quote in enumerate(quotes):
@@ -460,7 +488,7 @@ class _Parser:
         tagged = el.find("text/quote/header-in-text") is not None
         self.bill.instructions.append(Instruction(
             cite=cite_text, raw=full, target=target, path=path + located,
-            heading=heading or more_heading or tagged, action=action, args=args))
+            heading=heading or more_heading or tagged, action=action, args=args, within=within + more_within))
 
 
 def parse_bill(xml: bytes) -> Bill:

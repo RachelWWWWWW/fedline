@@ -196,6 +196,37 @@ class TextEditTests(unittest.TestCase):
                          "[-Except as provided, if it finds that-][+Except+], the")
 
 
+class InlineParagraphTests(unittest.TestCase):
+    """The Code prints NEPA § 102(1) and (2) inside 42 U.S.C. § 4332's introduction, with (2)'s subparagraphs
+    directly under the section."""
+
+    def setUp(self):
+        self.root = Node("section", "4332", label=Text("§ 4332."), body=Text(
+            "The Congress directs that: (1) the policies shall be interpreted, and (2) all agencies shall—"),
+            children=[Node("subparagraph", "A", label=Text("(A)"), body=Text("utilize an approach;")),
+                      Node("subparagraph", "B", label=Text("(B)"), body=Text("identify methods."))])
+        self.doc = SimpleNamespace(title="42 U.S.C. § 4332", root=self.root)
+        self.engine = Engine(SimpleNamespace(), {})
+
+    def apply(self, path, action, **args):
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=path, action=action, args=args)
+        node = self.engine._walk(self.root, path, inst, self.doc)
+        return self.engine._operate(inst, self.doc, node)
+
+    def test_subdivisions_of_the_inline_paragraph_are_found(self):
+        self.apply([("subsection", "2"), ("subparagraph", "B")], "replace_at_end", old=".", new=";", after=None)
+        self.assertEqual(marked(self.root.children[1].body), "identify methods[-.-][+;+]")
+        self.assertEqual([f.blocking for f in self.engine.outcome.flags], [False])
+
+    def test_only_the_last_inline_designation_owns_the_subdivisions(self):
+        with self.assertRaises(_NotApplied):
+            self.apply([("subsection", "1"), ("subparagraph", "A")], "replace", old="an", new="a", every=False)
+
+    def test_text_edits_to_the_inline_paragraph_itself_are_refused(self):
+        with self.assertRaises(_NotApplied):
+            self.apply([("subsection", "2")], "replace", old="agencies", new="bodies", every=False)
+
+
 class RewriteTests(unittest.TestCase):
     def test_rewrite_keeps_the_designation_and_replaces_the_rest(self):
         old = Node("section", "4336c", label=Text("§ 4336c."), heading=Text("Old"), body=Text("Old text."),

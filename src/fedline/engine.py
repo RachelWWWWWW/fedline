@@ -49,6 +49,16 @@ def _word_matches(phrase: str, text: str, ignore_case: bool = False) -> list[re.
     return list(re.finditer(rf"{before}{re.escape(phrase)}{after}", text, flags))
 
 
+_SUBDIVISION_ACTIONS = ("delete_nodes", "replace_nodes", "redesignate", "insert_after_node", "add_at_end")
+
+
+def _ends_with_inline(node: Node, value: str) -> bool:
+    """Whether node's introductory text ends by introducing an inline ({value}), whose subdivisions follow."""
+    text = node.body.current().rstrip()
+    inline = re.findall(r"(?:^|\s)\((\w+)\) ", text)
+    return bool(inline) and inline[-1] == value and text.endswith("—") and bool(node.children)
+
+
 def _swap(text: Text, start: int, end: int, new: str, source: str) -> None:
     """Replace a range. A pure deletion takes one neighboring space with it, so no double space is left."""
     if new:
@@ -73,6 +83,7 @@ class Engine:
         self.outcome = Outcome(release_points={n: t.release_point for n, t in titles.items()})
         self.global_phrases: list[tuple[str, Document, str]] = []
         self.duplicates: set[tuple[int, tuple[str, str]]] = set()
+        self.inline: set[tuple[int, str]] = set()
 
     def run(self) -> Outcome:
         for problem in self.bill.problems:
@@ -195,8 +206,22 @@ class Engine:
         return self._operate(inst, doc, node)
 
     def _walk(self, node: Node, path, inst, doc) -> Node:
-        for kind, value in path:
+        for index, (kind, value) in enumerate(path):
             child = node.live_child(value, kind) or node.live_child(value)
+            if child is None and _ends_with_inline(node, value):
+                # The Code sometimes prints a paragraph's designation inside the text that introduces it,
+                # as in "(1) … and (2) all agencies shall—", and puts (2)'s subdivisions directly under the
+                # section. Only operations on those subdivisions can be placed there safely.
+                if index == len(path) - 1 and inst.action not in _SUBDIVISION_ACTIONS:
+                    raise _NotApplied(f"Not applied: ({value}) has no text of its own in "
+                                      f"{_describe(node, doc)}; the Code runs it into the introductory text.",
+                                      doc, node)
+                if (id(node), value) not in self.inline:
+                    self.inline.add((id(node), value))
+                    self._flag(inst.cite, f"The Code prints ({value}) inside the introductory text of "
+                                          f"{_describe(node, doc)} and puts its subdivisions directly under it. "
+                                          "Applied there.", False, doc, node)
+                continue
             if child is None:
                 raise _NotApplied(
                     f"Not applied: {kind} ({value}) wasn't found under {_describe(node, doc)}.", doc, node)

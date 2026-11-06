@@ -204,8 +204,26 @@ def _local(el: ET.Element) -> str:
     return el.tag.rsplit("}", 1)[-1]
 
 
+def _is_footnote(el: ET.Element) -> bool:
+    """A footnote the Code's editors added, or the reference mark pointing to one."""
+    tag = _local(el)
+    return ((tag == "ref" and "footnoteRef" in (el.get("class") or "").split())
+            or (tag == "note" and el.get("type") == "footnote"))
+
+
+def _itertext(el: ET.Element):
+    """Like el.itertext(), but leaving out editorial footnotes, which aren't part of the statute."""
+    if el.text:
+        yield el.text
+    for child in el:
+        if not _is_footnote(child):
+            yield from _itertext(child)
+        if child.tail:
+            yield child.tail
+
+
 def _flat(el: ET.Element) -> str:
-    return norm("".join(el.itertext()))
+    return norm("".join(_itertext(el)))
 
 
 def _strip_ws(text: str) -> str:
@@ -240,12 +258,12 @@ def parse_uslm_node(el: ET.Element) -> Node:
 
 
 def _body_source_text(el: ET.Element) -> str:
-    """Read a section's text straight from the XML, skipping notes and credits."""
+    """Read a section's text straight from the XML, skipping notes, credits and footnotes."""
     parts = []
     for child in el:
         if _local(child) in ("notes", "sourceCredit"):
             continue
-        parts.append("".join(child.itertext()))
+        parts.append("".join(_itertext(child)))
     return _strip_ws("".join(parts))
 
 
@@ -348,14 +366,14 @@ class CodeTitle:
         intro = ""
         if parent is not None:
             intro = norm((parent.text or "") + "".join(
-                "".join(c.itertext()) + (c.tail or "") for c in parent if c is not quoted))
+                ("" if _is_footnote(c) else "".join(_itertext(c))) + (c.tail or "") for c in parent if c is not quoted))
         return Document(
             key=f"{self.number}usc{number}note:{name}",
             title=f"{self.number} U.S.C. § {number} note ({name})",
             root=root,
             basis="note",
             source_text=_strip_ws("".join(
-                "".join(c.itertext()) for c in quoted if _local(c) in LEVELS)),
+                "".join(_itertext(c)) for c in quoted if _local(c) in LEVELS)),
             intro=(_flat(heading) + ". " if heading is not None else "") + intro,
             order=(self.number, _sort_key(number), 1),
         )

@@ -72,6 +72,19 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(len(_word_matches(", including x", "facilities, including x (other)")), 1)
 
 
+class FootnoteTests(unittest.TestCase):
+    XML = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>30</docNumber></meta><main>'
+           '<section identifier="/us/usc/t30/s352"><num value="352">§ 352.</num><content>Under the Act '
+           '(sec. 1611),<ref class="footnoteRef" idref="fn1">1</ref><note type="footnote" id="fn1"><num>1</num> '
+           'See References in Text note below.</note> all deposits. Then the Secretary acts.</content>'
+           '<sourceCredit>(Aug. 7, 1947, ch. 513, § 3.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def test_editorial_footnotes_are_left_out_of_the_text(self):
+        doc = CodeTitle(self.XML).document("352")
+        self.assertEqual(doc.root.body.current(), "Under the Act (sec. 1611), all deposits. Then the Secretary acts.")
+        self.assertEqual(doc.source_text, "§352.UndertheAct(sec.1611),alldeposits.ThentheSecretaryacts.")
+
+
 class CreditTests(unittest.TestCase):
     def test_public_law(self):
         self.assertEqual(credit_origin("(Pub. L. 104–104, § 3, Feb. 8, 1996, 110 Stat. 56.)"),

@@ -149,10 +149,53 @@ _LEVEL_WORDS = {f"{word}s": word for word in LEVELS} | {word: word for word in L
 _AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|added|amended)[^)]*\)")
 
 
-def _designators(text: str, kind: str) -> list[str]:
-    if kind == "section":
-        return re.findall(r"\b(\d+\w*)\b", text)
-    return re.findall(r"\((\w+)\)", text)
+def _roman(n: int) -> str:
+    out = ""
+    for value, letters in ((10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")):
+        while n >= value:
+            out, n = out + letters, n - value
+    return out
+
+
+_ROMANS = [_roman(n) for n in range(1, 40)]
+
+
+def _span(start: str, end: str, kind: str) -> list[str] | None:
+    """Expand 'start through end' in the numbering style of its level, or None if unsure."""
+    if start.isdigit() and end.isdigit():
+        values = [str(n) for n in range(int(start), int(end) + 1)]
+    elif kind in ("clause", "subclause"):
+        romans = _ROMANS if kind == "clause" else [r.upper() for r in _ROMANS]
+        if start not in romans or end not in romans:
+            return None
+        values = romans[romans.index(start):romans.index(end) + 1]
+    elif len(start) == len(end) == 1 and start.isalpha() and start.islower() == end.islower():
+        values = [chr(c) for c in range(ord(start), ord(end) + 1)]
+    else:
+        return None
+    return values if len(values) > 1 else None
+
+
+def _designators(text: str, kind: str) -> list[str] | None:
+    """The designations listed in text, expanding ranges. None if a range can't be expanded."""
+    pattern = r"\b(\d+\w*)\b" if kind == "section" else r"\((\w+)\)"
+    values: list[str] = []
+    pending_range = False
+    for match in re.finditer(rf"{pattern}|\bthrough\b", text):
+        if match.group(0) == "through":
+            if not values:
+                return None
+            pending_range = True
+            continue
+        if pending_range:
+            span = _span(values[-1], match.group(1), kind)
+            if span is None:
+                return None
+            values += span[1:]
+            pending_range = False
+        else:
+            values.append(match.group(1))
+    return None if pending_range else values
 
 
 def _parse_locators(text: str) -> tuple[list[tuple[str, str]], bool, str]:
@@ -220,12 +263,16 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
     match = re.fullmatch(rf"by striking ({kinds}) (.+?) and inserting the following:?", text)
     if match and blocks:
         kind = _LEVEL_WORDS[match.group(1)]
-        return "replace_nodes", {"kind": kind, "values": _designators(match.group(2), kind), "blocks": blocks}
+        values = _designators(match.group(2), kind)
+        if values:
+            return "replace_nodes", {"kind": kind, "values": values, "blocks": blocks}
 
     match = re.fullmatch(rf"by amending ({kinds}) (.+?) to read as follows:?", text)
     if match and blocks:
         kind = _LEVEL_WORDS[match.group(1)]
-        return "replace_nodes", {"kind": kind, "values": _designators(match.group(2), kind), "blocks": blocks}
+        values = _designators(match.group(2), kind)
+        if values:
+            return "replace_nodes", {"kind": kind, "values": values, "blocks": blocks}
 
     match = re.fullmatch(rf"by striking ({kinds}) (.+)", text)
     if match:
@@ -234,11 +281,13 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
         if values:
             return "delete_nodes", {"kind": kind, "values": values}
 
-    match = re.fullmatch(rf"by redesignating ({kinds}) (.+?) as (?:{kinds}) (.+?)(?:, respectively)?", text)
+    match = re.fullmatch(rf"by redesignating ({kinds}) (.+?) as ({kinds}) (.+?)(?:, respectively)?", text)
     if match:
         kind = _LEVEL_WORDS[match.group(1)]
-        return "redesignate", {"kind": kind, "old": _designators(match.group(2), kind),
-                               "new": _designators(match.group(3), kind)}
+        old = _designators(match.group(2), kind)
+        new = _designators(match.group(4), _LEVEL_WORDS[match.group(3)])
+        if old and new:
+            return "redesignate", {"kind": kind, "old": old, "new": new}
 
     match = re.fullmatch(r"by adding at the end the following:?", text)
     if match and blocks:
@@ -247,7 +296,9 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
     match = re.fullmatch(rf"by inserting after ({kinds}) (.+?) the following:?", text)
     if match and blocks:
         kind = _LEVEL_WORDS[match.group(1)]
-        return "insert_after_node", {"kind": kind, "values": _designators(match.group(2), kind), "blocks": blocks}
+        values = _designators(match.group(2), kind)
+        if values:
+            return "insert_after_node", {"kind": kind, "values": values, "blocks": blocks}
 
     return None
 

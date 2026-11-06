@@ -158,9 +158,35 @@ class Document:
     order: tuple = ()
 
 
+# The start of a source credit: the enacting law, then any title or part, then the section.
+# Divisions are kept with the law because omnibus laws restart section numbers in each division.
+_CREDIT = re.compile(
+    r"\(?(?:Pub\. L\. (?P<pl>\d+[–-]\d+)(?:, (?P<div>div\. \w+))?"
+    r"|(?P<date>[A-Z][a-z]+\.? \d+, \d{4}), (?P<ch>ch\. \w+)"
+    r"|R\.S\.)"
+    r"(?:, (?:title|subtitle|pt\.|subpart) [\w-]+)*,? § (?P<section>\w+)\b"
+)
+
+
+def credit_origin(credit: str) -> tuple[str, str] | None:
+    """Read the enacting law and its section number from a source credit."""
+    match = _CREDIT.match(credit)
+    if not match:
+        return None
+    if match.group("pl"):
+        law = f"Pub. L. {match.group('pl').replace('–', '-')}"
+        if match.group("div"):
+            law += f", {match.group('div')}"
+    elif match.group("date"):
+        law = f"Act of {match.group('date')}, {match.group('ch')}"
+    else:
+        law = "R.S."
+    return law, match.group("section")
+
+
 @dataclass
 class Act:
-    public_law: str
+    law: str
     sections: dict[str, Document] = field(default_factory=dict)
     title: int = 0
 
@@ -257,23 +283,28 @@ class CodeTitle:
         origin = self._origin(number)
         if origin is None:
             return None
-        public_law, _ = origin
-        act = Act(public_law=public_law, title=self.number)
+        law, _ = origin
+        act = Act(law=law, title=self.number)
+        ambiguous = set()
         for candidate in self.sections:
             found = self._origin(candidate)
-            if found and found[0] == public_law:
+            if found and found[0] == law:
                 doc = self.document(candidate)
-                if doc is not None:
-                    act.sections.setdefault(found[1], doc)
+                if doc is None:
+                    continue
+                if found[1] in act.sections:
+                    # Two Code sections credit the same Act section, so neither can be chosen safely.
+                    ambiguous.add(found[1])
+                act.sections.setdefault(found[1], doc)
+        for section in ambiguous:
+            del act.sections[section]
         return act
 
     def _origin(self, number: str) -> tuple[str, str] | None:
+        """The law a Code section was enacted by, and its section number in that law."""
         el = self.sections.get(number)
         credit = el.find(f"{{{self.ns}}}sourceCredit") if el is not None else None
-        if credit is None:
-            return None
-        match = re.match(r"\(?Pub\. L\. (\d+)[–-](\d+), § (\w+)\b", _flat(credit))
-        return (f"{match.group(1)}-{match.group(2)}", match.group(3)) if match else None
+        return credit_origin(_flat(credit)) if credit is not None else None
 
     def note_for_act(self, number: str, act_name: str) -> Document | None:
         """Find an Act reproduced in the notes of a Code section, by its name."""

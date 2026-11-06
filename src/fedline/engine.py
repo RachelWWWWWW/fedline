@@ -353,8 +353,8 @@ class Engine:
             number = block.value
             order = (previous.order[0], previous.order[1], 2 + index) if previous else (act.title, (10 ** 9, ""), index)
             doc = Document(
-                key=f"new:{act.public_law}:{number}",
-                title=f"New § {number} of Pub. L. {act.public_law} (no Code section number yet)",
+                key=f"new:{act.law}:{number}",
+                title=f"New § {number} of {act.law} (no Code section number yet)",
                 root=block,
                 basis="new",
                 order=order,

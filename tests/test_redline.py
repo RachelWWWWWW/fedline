@@ -7,11 +7,12 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from fedline.bill import _designators
 from fedline.cli import redline
 from fedline.docx_writer import write_docx
 from fedline.engine import _word_matches
 from fedline.sources import SourceError, parse_bill_url
-from fedline.statute import CodeTitle, DEL, INS, Text
+from fedline.statute import CodeTitle, DEL, INS, Text, credit_origin
 
 FIXTURES = Path(__file__).parent / "fixtures"
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -64,6 +65,43 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(_word_matches(phrase, "covered communications equipment or services"), [])
         self.assertEqual(_word_matches(phrase, "telecommunications equipment or service"), [])
         self.assertEqual(len(_word_matches(phrase, "any communications equipment or service, if")), 1)
+
+
+class CreditTests(unittest.TestCase):
+    def test_public_law(self):
+        self.assertEqual(credit_origin("(Pub. L. 104–104, § 3, Feb. 8, 1996, 110 Stat. 56.)"),
+                         ("Pub. L. 104-104", "3"))
+
+    def test_titles_are_skipped(self):
+        credit = "(Pub. L. 91–190, title I, § 107, as added Pub. L. 118–5, div. C, title III, § 321(b), June 3, 2023)"
+        self.assertEqual(credit_origin(credit), ("Pub. L. 91-190", "107"))
+
+    def test_divisions_stay_with_the_law(self):
+        credit = "(Pub. L. 116–260, div. Z, title III, § 3102, Dec. 27, 2020, 134 Stat. 2514.)"
+        self.assertEqual(credit_origin(credit), ("Pub. L. 116-260, div. Z", "3102"))
+
+    def test_chapter_laws(self):
+        credit = "(June 10, 1920, ch. 285, pt. II, § 216, as added Pub. L. 109–58, title XII, § 1221(a), Aug. 8, 2005)"
+        self.assertEqual(credit_origin(credit), ("Act of June 10, 1920, ch. 285", "216"))
+        self.assertEqual(credit_origin("(Feb. 25, 1920, ch. 85, § 17, 41 Stat. 443.)"),
+                         ("Act of Feb. 25, 1920, ch. 85", "17"))
+
+    def test_revised_statutes(self):
+        self.assertEqual(credit_origin("(R.S. § 2337; Pub. L. 86–390, Mar. 18, 1960, 74 Stat. 7.)"), ("R.S.", "2337"))
+
+
+class DesignatorTests(unittest.TestCase):
+    def test_ranges_expand_in_each_numbering_style(self):
+        self.assertEqual(_designators("(2) through (6)", "paragraph"), ["2", "3", "4", "5", "6"])
+        self.assertEqual(_designators("(a) through (c)", "subsection"), ["a", "b", "c"])
+        self.assertEqual(_designators("(iii) through (vi)", "clause"), ["iii", "iv", "v", "vi"])
+        self.assertEqual(_designators("(II) through (IV)", "subclause"), ["II", "III", "IV"])
+        self.assertEqual(_designators("(1), (3) through (5), and (7)", "paragraph"), ["1", "3", "4", "5", "7"])
+        self.assertEqual(_designators("5 through 7", "section"), ["5", "6", "7"])
+
+    def test_ranges_it_cannot_expand_are_refused(self):
+        self.assertIsNone(_designators("(aa) through (cc)", "item"))
+        self.assertIsNone(_designators("(5A) through (7)", "paragraph"))
 
 
 class UrlTests(unittest.TestCase):

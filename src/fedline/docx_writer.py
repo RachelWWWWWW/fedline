@@ -18,7 +18,7 @@ W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
 GREEN, RED = "00803C", "C00000"
 _INDENT = {"section": 0, "subsection": 0, "paragraph": 1, "subparagraph": 2,
-           "clause": 3, "subclause": 4, "item": 5, "subitem": 6}
+           "clause": 3, "subclause": 4, "item": 5, "subitem": 6, "subsubitem": 7}
 SCOPE_NOTE = ("This redline shows only the text that the bill directly changes. It doesn't detect other laws "
               "whose cross-references are affected, so a clean redline isn't the bill's full effect.")
 
@@ -101,7 +101,10 @@ class Writer:
     def _pieces(self, text: Text, bold: bool = False) -> list[_Piece]:
         return [_Piece(s.text, s.status, s.sources, bold) for s in text.segments if s.text]
 
-    def _lines(self, node: Node, flags: dict[int, list[Flag]], lines: list[_Line], root: bool = False) -> None:
+    def _lines(self, node: Node, flags: dict[int, list[Flag]], lines: list[_Line], root: bool = False,
+               parent_indent: int = -1) -> None:
+        # A generic "level" goes one step in from its parent.
+        indent = 0 if root else _INDENT.get(node.kind, parent_indent + 1)
         pieces: list[_Piece] = []
         for part, bold in ((node.label, True), (node.heading, True), (node.body, False)):
             new = self._pieces(part, bold)
@@ -110,19 +113,19 @@ class Writer:
                     pieces.append(_Piece(" ", ORIG, (), False))
                 pieces.extend(new)
         if pieces:
-            lines.append(_Line(pieces, 0 if root else _INDENT.get(node.kind, 0)))
+            lines.append(_Line(pieces, indent))
         lines.extend(_Line(flag=f) for f in flags.get(id(node), []))
         for child in node.children:
             if child.kind == "continuation":
                 # Text between subdivisions lines up with the text that introduced them.
                 text = self._pieces(child.body)
                 if text:
-                    lines.append(_Line(text, 0 if root else _INDENT.get(node.kind, 0)))
+                    lines.append(_Line(text, indent))
                 continue
-            self._lines(child, flags, lines)
+            self._lines(child, flags, lines, parent_indent=indent)
         tail = self._pieces(node.tail)
         if tail:
-            lines.append(_Line(tail, 0 if root else _INDENT.get(node.kind, 0)))
+            lines.append(_Line(tail, indent))
 
     def _render_lines(self, lines: list[_Line]) -> str:
         """Render lines, with one footnote per run of adjacent changes from the same provisions."""

@@ -114,6 +114,41 @@ class ContinuationTests(unittest.TestCase):
                          "the [-Secretary-][+Director+] shall provide a statement that—")
 
 
+class UslmShapeTests(unittest.TestCase):
+    """Shapes from the Code that each used to lose or misplace text."""
+
+    def section(self, inner):
+        xml = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>15</docNumber></meta><main>'
+               f'<section identifier="/us/usc/t15/s1"><num value="1">§ 1.</num>{inner}'
+               '<sourceCredit>(Pub. L. 1–1, § 1.)</sourceCredit></section></main></uscDoc>').encode()
+        doc = CodeTitle(xml).document("1")
+        self.assertEqual(_strip_ws(doc.root.before_text()), doc.source_text)
+        return doc.root
+
+    def test_content_text_before_its_paragraphs(self):  # 15 U.S.C. 12(a)
+        root = self.section('<content>"Antitrust laws" includes the Sherman Act.<p>"Commerce" means trade.</p>'
+                            '<p>"Person" includes corporations.</p></content>')
+        self.assertEqual(root.body.current().split("\n"),
+                         ['"Antitrust laws" includes the Sherman Act.', '"Commerce" means trade.',
+                          '"Person" includes corporations.'])
+
+    def test_generic_levels_and_subsubitems(self):  # 30 U.S.C. 524, 825
+        root = self.section('<chapeau>Every claim—</chapeau><level><num value="a">(a)</num><content>leased; or</content>'
+                            '</level><subsubitem><num value="aaa">(aaa)</num><content>covered.</content></subsubitem>')
+        self.assertEqual([(c.kind, c.value) for c in root.children], [("level", "a"), ("subsubitem", "aaa")])
+
+    def test_provisos_notes_and_later_chapeaus_keep_their_place(self):  # 15 U.S.C. 46, 16 U.S.C. 410hh, 460u-3
+        root = self.section('<chapeau>The term means—</chapeau><paragraph><num value="1">(1)</num><content>a house.'
+                            '</content></paragraph><chapeau>It also includes land that—</chapeau><subparagraph>'
+                            '<num value="A">(A)</num><content>is owned.</content></subparagraph><note topic="x">'
+                            '<p>[Amended this section.]</p></note><paragraph><num value="2">(2)</num><content>a barn.'
+                            '</content></paragraph><proviso>Provided, That this applies.</proviso>')
+        self.assertEqual(root.body.current(), "The term means—")
+        self.assertEqual([(c.kind, c.body.current()) for c in root.children if c.kind == "continuation"],
+                         [("continuation", "It also includes land that—"), ("continuation", "[Amended this section.]")])
+        self.assertEqual(root.tail.current(), "Provided, That this applies.")
+
+
 class CreditTests(unittest.TestCase):
     def test_public_law(self):
         self.assertEqual(credit_origin("(Pub. L. 104–104, § 3, Feb. 8, 1996, 110 Stat. 56.)"),

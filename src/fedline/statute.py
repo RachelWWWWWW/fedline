@@ -13,7 +13,13 @@ from dataclasses import dataclass, field
 from xml.etree import ElementTree as ET
 
 ORIG, DEL, INS = "orig", "del", "ins"
-LEVELS = ("section", "subsection", "paragraph", "subparagraph", "clause", "subclause", "item", "subitem")
+LEVELS = ("section", "subsection", "paragraph", "subparagraph", "clause", "subclause", "item", "subitem",
+          "subsubitem")
+# Elements the Code uses for subdivisions. "level" is a generic one, used where the usual names don't fit.
+_SUBDIVISIONS = LEVELS + ("level",)
+# Text printed between or after subdivisions. Notes here are bracketed editorial text, like "[Amended this
+# section.]", printed in place in the Code; footnotes are left out separately.
+_RUNNING_TEXT = ("continuation", "proviso", "note")
 
 
 def norm(text: str) -> str:
@@ -244,25 +250,35 @@ def parse_uslm_node(el: ET.Element) -> Node:
     node = Node(kind=_local(el))
     body_parts: list[str] = []
     tail_parts: list[str] = []
-    levels = [i for i, child in enumerate(el) if _local(child) in LEVELS]
+    levels = [i for i, child in enumerate(el) if _local(child) in _SUBDIVISIONS]
     for i, child in enumerate(el):
         tag = _local(child)
-        if tag == "continuation" and levels and i < levels[-1]:
-            # Text between subdivisions, as in 16 U.S.C. 1536(b)(4), stays where it is in reading order.
-            node.children.append(Node(kind="continuation", body=Text(_flat(child))))
+        if _is_footnote(child):
+            continue
+        if tag in _RUNNING_TEXT or (tag in ("chapeau", "content", "p") and levels and i > levels[0]):
+            # Text keeps its place in reading order: before the first subdivision it's introductory text,
+            # between subdivisions (as in 16 U.S.C. 1536(b)(4), or a second chapeau as in 460u-3) it's an
+            # unlabeled node, and after the last it follows them.
+            if not levels or i < levels[0]:
+                body_parts.append(_flat(child))
+            elif i < levels[-1]:
+                node.children.append(Node(kind="continuation", body=Text(_flat(child))))
+            else:
+                tail_parts.append(_flat(child))
         elif tag == "num":
             node.value = child.get("value", "")
             node.label = Text(_flat(child))
         elif tag == "heading":
             node.heading = Text(_flat(child))
-        elif tag in LEVELS:
+        elif tag in _SUBDIVISIONS:
             node.children.append(parse_uslm_node(child))
-        elif tag == "continuation":
-            tail_parts.append(_flat(child))
         elif tag in ("chapeau", "content", "p"):
             paragraphs = list(child)
             if tag == "content" and len(paragraphs) > 1 and all(_local(p) == "p" for p in paragraphs):
-                body_parts.extend(_flat(p) for p in paragraphs)
+                # Keep any text before or between the paragraphs, as in 15 U.S.C. 12(a).
+                body_parts.append(norm(child.text or ""))
+                for p in paragraphs:
+                    body_parts += [_flat(p), norm(p.tail or "")]
             else:
                 body_parts.append(_flat(child))
     node.body = Text("\n".join(p for p in body_parts if p))

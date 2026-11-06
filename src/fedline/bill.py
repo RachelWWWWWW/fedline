@@ -233,17 +233,42 @@ def _path_from(kind: str, values: str) -> list[tuple[str, str]]:
     return [(kind, vals[0])] + _level_for(vals[1:], kind)
 
 
+_PUNCTUATION = {"period": ".", "semicolon": ";", "comma": ",", "colon": ":"}
+
+
 def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str, dict] | None:
     """Recognize an instruction's operation. Returns None when it isn't understood."""
     text = re.sub(r"[;.,]?(?: and| or)?$", "", text).strip()
     q = lambda m, name: quotes[int(m.group(name))]
 
+    punct = "|".join(_PUNCTUATION)
+    new = rf"(?:⟦(?P<b>\d+)⟧|a (?P<pb>{punct}))"
+    new_text = lambda m: q(m, "b") if m.group("b") else _PUNCTUATION.get(m.group("pb") or "", "")
+
     match = re.fullmatch(
         r"by striking ⟦(?P<a>\d+)⟧(?P<every> each place (?:it|such term) appears?)?"
-        r"(?: \(except in section (?P<ex>\w+)\))? and inserting ⟦(?P<b>\d+)⟧", text)
+        rf"(?: \(except in section (?P<ex>\w+)\))?(?: and inserting {new})?", text)
     if match:
-        return "replace", {"old": q(match, "a"), "new": q(match, "b"),
+        return "replace", {"old": q(match, "a"), "new": new_text(match),
                            "every": bool(match.group("every")), "except": match.group("ex")}
+
+    match = re.fullmatch(
+        rf"by striking (?:⟦(?P<a>\d+)⟧|the (?P<pa>{punct}))(?: after the (?P<after>{punct}))? at the end"
+        rf"(?: and inserting {new})?", text)
+    if match:
+        return "replace_at_end", {
+            "old": q(match, "a") if match.group("a") else _PUNCTUATION[match.group("pa")],
+            "after": _PUNCTUATION.get(match.group("after") or ""),
+            "new": new_text(match)}
+
+    match = re.fullmatch(
+        rf"by striking ⟦(?P<a>\d+)⟧ and all that follows through (?:⟦(?P<c>\d+)⟧|the (?P<pc>{punct}) at the end)"
+        rf"(?: and inserting {new})?", text)
+    if match:
+        return "replace_span", {
+            "start": q(match, "a"), "end": q(match, "c") if match.group("c") else None,
+            "end_punct": _PUNCTUATION.get(match.group("pc") or ""),
+            "new": new_text(match)}
 
     match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ before ⟦(?P<b>\d+)⟧", text)
     if match:

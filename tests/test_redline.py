@@ -4,13 +4,15 @@ import os
 import tempfile
 import unittest
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from fedline.bill import _designators, parse_bill
 from fedline.cli import redline
 from fedline.docx_writer import write_docx
-from fedline.engine import _word_matches
+from fedline.bill import Instruction, Target
+from fedline.engine import Engine, _NotApplied, _word_matches
 from fedline.sources import SourceError, parse_bill_url
 from fedline.statute import CodeTitle, DEL, INS, Node, Text, credit_origin
 
@@ -65,6 +67,9 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(_word_matches(phrase, "covered communications equipment or services"), [])
         self.assertEqual(_word_matches(phrase, "telecommunications equipment or service"), [])
         self.assertEqual(len(_word_matches(phrase, "any communications equipment or service, if")), 1)
+
+    def test_phrases_starting_with_punctuation_can_follow_a_word(self):
+        self.assertEqual(len(_word_matches(", including x", "facilities, including x (other)")), 1)
 
 
 class CreditTests(unittest.TestCase):
@@ -126,6 +131,25 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(bill.problems, [])
         self.assertEqual(bill.instructions[0].path, [("subsection", "b")])
 
+    def test_strike_patterns(self):
+        def action(text):
+            bill = parse_sections(f"<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is "
+                                  f"amended {text}</text></section>")
+            self.assertEqual(bill.problems, [])
+            return bill.instructions[0].action, bill.instructions[0].args
+
+        self.assertEqual(action("by striking <quote>as needed</quote>."),
+                         ("replace", {"old": "as needed", "new": "", "every": False, "except": None}))
+        self.assertEqual(action("by striking <quote>; and</quote> and inserting a period."),
+                         ("replace", {"old": "; and", "new": ".", "every": False, "except": None}))
+        self.assertEqual(action("by striking <quote>and</quote> after the semicolon at the end."),
+                         ("replace_at_end", {"old": "and", "after": ";", "new": ""}))
+        self.assertEqual(action("by striking the period at the end and inserting <quote>; and</quote>."),
+                         ("replace_at_end", {"old": ".", "after": None, "new": "; and"}))
+        self.assertEqual(action("by striking <quote>A</quote> and all that follows through the period at the end "
+                                "and inserting <quote>B.</quote>."),
+                         ("replace_span", {"start": "A", "end": None, "end_punct": ".", "new": "B."}))
+
     def test_amended_to_read_as_follows(self):
         bill = parse_sections(
             "<section><enum>2.</enum><text>Section 6 of the Foo Act (42 U.S.C. 101) is amended to read as follows:"
@@ -133,6 +157,43 @@ class ParserTests(unittest.TestCase):
             "</section></quoted-block></section>")
         self.assertEqual(bill.problems, [])
         self.assertEqual(bill.instructions[0].action, "rewrite")
+
+
+def operate(action: str, body: str, **args) -> Text:
+    """Apply one parsed operation to a section with the given text and return that text."""
+    node = Node("section", "1", body=Text(body))
+    doc = SimpleNamespace(title="Test § 1", root=node)
+    inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action=action, args=args)
+    Engine(SimpleNamespace(), {})._operate(inst, doc, node)
+    return node.body
+
+
+class TextEditTests(unittest.TestCase):
+    def test_pure_deletion_takes_one_space(self):
+        self.assertEqual(marked(operate("replace", "audits as needed; and", old="as needed", new="", every=False)),
+                         "audits[- as needed-]; and")
+        self.assertEqual(marked(operate("replace", "shall ensure", old="shall", new="", every=False)),
+                         "[-shall -]ensure")
+
+    def test_word_at_the_end(self):
+        self.assertEqual(marked(operate("replace_at_end", "law; or", old="or", new="", after=None)), "law;[- or-]")
+        self.assertEqual(marked(operate("replace_at_end", "law; and", old="and", new="", after=";")), "law;[- and-]")
+        with self.assertRaises(_NotApplied):
+            operate("replace_at_end", "a door", old="or", new="", after=None)
+        with self.assertRaises(_NotApplied):
+            operate("replace_at_end", "law, and", old="and", new="", after=";")
+
+    def test_punctuation_at_the_end(self):
+        self.assertEqual(marked(operate("replace_at_end", "this title.", old=".", new="; and", after=None)),
+                         "this title[-.-][+; and+]")
+
+    def test_all_that_follows_through(self):
+        self.assertEqual(marked(operate("replace_span", "shall conform to State practice.", start="shall conform",
+                                        end=None, end_punct=".", new="shall follow rule 71.1.")),
+                         "[-shall conform to State practice.-][+shall follow rule 71.1.+]")
+        self.assertEqual(marked(operate("replace_span", "Except as provided, if it finds that, the", start="Except",
+                                        end="finds that", end_punct=None, new="Except")),
+                         "[-Except as provided, if it finds that-][+Except+], the")
 
 
 class RewriteTests(unittest.TestCase):

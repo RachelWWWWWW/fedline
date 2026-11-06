@@ -42,8 +42,24 @@ class Outcome:
 
 
 def _word_matches(phrase: str, text: str, ignore_case: bool = False) -> list[re.Match]:
+    """Matches of phrase that don't start or end partway through a word."""
     flags = re.IGNORECASE if ignore_case else 0
-    return list(re.finditer(rf"(?<!\w){re.escape(phrase)}(?!\w)", text, flags))
+    before = r"(?<!\w)" if phrase[:1].isalnum() else ""
+    after = r"(?!\w)" if phrase[-1:].isalnum() else ""
+    return list(re.finditer(rf"{before}{re.escape(phrase)}{after}", text, flags))
+
+
+def _swap(text: Text, start: int, end: int, new: str, source: str) -> None:
+    """Replace a range. A pure deletion takes one neighboring space with it, so no double space is left."""
+    if new:
+        text.replace(start, end, new, source)
+        return
+    current = text.current()
+    if start > 0 and current[start - 1] == " " and (end == len(current) or current[end] in " ,;:.)"):
+        start -= 1
+    elif start == 0 and current[end:end + 1] == " ":
+        end += 1
+    text.strike(start, end, source)
 
 
 class Engine:
@@ -199,6 +215,10 @@ class Engine:
             return self._insert_text(inst, doc, node)
         if action == "insert_before_period":
             return self._insert_before_period(inst, doc, node)
+        if action == "replace_at_end":
+            return self._replace_at_end(inst, doc, node)
+        if action == "replace_span":
+            return self._replace_span(inst, doc, node)
         if action == "delete_nodes":
             for child in self._children(inst, doc, node, args["values"], args["kind"]):
                 child.delete(inst.cite)
@@ -266,7 +286,7 @@ class Engine:
             self._flag(inst.cite, f"The text “{match.group(0)}” differs in capitalization from the bill's "
                                   f"“{old}”. Applied, using the bill's capitalization for the new text.",
                        False, doc, node)
-        text.replace(match.start(), match.end(), new, inst.cite)
+        _swap(text, match.start(), match.end(), new, inst.cite)
         return True
 
     def _replace_every(self, inst, doc, node) -> bool:
@@ -281,7 +301,7 @@ class Engine:
         count = 0
         for text in self._scope(inst, node):
             for match in reversed(_word_matches(old, text.current())):
-                text.replace(match.start(), match.end(), new, inst.cite)
+                _swap(text, match.start(), match.end(), new, inst.cite)
                 count += 1
         if not inst.heading:
             self.global_phrases.append((old, doc, inst.cite))
@@ -297,6 +317,46 @@ class Engine:
         if not total:
             self._flag(inst.cite, f"“{inst.args['old']}” wasn't found in any section of the Act in the Code.")
             return False
+        return True
+
+    def _replace_at_end(self, inst, doc, node) -> bool:
+        """'By striking "or" at the end', 'the period at the end and inserting "; and"' and the like."""
+        old, new, after = inst.args["old"], inst.args["new"], inst.args["after"]
+        blocks = [t for t in node.texts(headings=False) if t.current()]
+        text = blocks[-1] if blocks else None
+        current = text.current().rstrip() if text else ""
+        if not current.endswith(old) or (old[:1].isalnum() and current[-len(old) - 1:-len(old)].isalnum()):
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't end with “{old}”.", doc, node)
+        start = len(current) - len(old)
+        if after and not current[:start].rstrip().endswith(after):
+            raise _NotApplied(f"Not applied: “{old}” at the end of {_describe(node, doc)} doesn't follow "
+                              f"“{after}”.", doc, node)
+        _swap(text, start, len(current), new, inst.cite)
+        return True
+
+    def _replace_span(self, inst, doc, node) -> bool:
+        """'By striking "A" and all that follows through "B"', within one block of text."""
+        start, end, new = inst.args["start"], inst.args["end"], inst.args["new"]
+        hits = [(t, m) for t in self._scope(inst, node) for m in _word_matches(start, t.current())]
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{start}” {problem} in {_describe(node, doc)}.", doc, node)
+        text, match = hits[0]
+        current = text.current()
+        if end is not None:
+            ends = _word_matches(end, current[match.end():])
+            if not ends:
+                raise _NotApplied(f"Not applied: “{end}” wasn't found after “{start}” in the same block of text "
+                                  f"in {_describe(node, doc)}.", doc, node)
+            stop = match.end() + ends[0].end()
+        else:
+            punct = inst.args["end_punct"]
+            blocks = [t for t in node.texts(headings=False) if t.current()]
+            if text is not blocks[-1] or not current.rstrip().endswith(punct):
+                raise _NotApplied(f"Not applied: the text from “{start}” to the “{punct}” at the end of "
+                                  f"{_describe(node, doc)} spans more than one block.", doc, node)
+            stop = len(current.rstrip())
+        _swap(text, match.start(), stop, new, inst.cite)
         return True
 
     def _insert_text(self, inst, doc, node) -> bool:

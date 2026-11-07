@@ -324,6 +324,33 @@ class NoteLookupTests(unittest.TestCase):
         self.assertEqual(outcome.applied, 0)
         self.assertIn("wasn't found in the Code notes", outcome.flags[0].message)
 
+    def test_an_act_cited_by_public_law_takes_its_section_and_code_cite_from_each_instruction(self):
+        # "The … Act (Public Law 118–159) is amended— (A) in section 1412(b)(2) (50 U.S.C. 98b note), by …"
+        code = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>50</docNumber></meta><main>'
+                '<section identifier="/us/usc/t50/s98b"><num value="98b">§ 98b.</num><content>Text.</content>'
+                '<sourceCredit>(Pub. L. 79–520, § 3.)</sourceCredit><notes><note topic="miscellaneous">'
+                '<heading>Stockpile</heading><p>Pub. L. 118–159, div. A, title XIV, § 1412, provided that:'
+                '<quotedContent origin="/us/pl/118/159/dA/tXIV/s1412"><subsection><num value="b">“(b)</num>'
+                '<heading> Review.—</heading><paragraph><num value="2">(2)</num><content>Exclusions under section 111 '
+                'of the National Environmental Policy Act of 1969 (42 U.S.C. 4336e) apply.</content></paragraph>'
+                '</subsection></quotedContent></p></note></notes></section></main></uscDoc>').encode()
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>The Servicemember Quality of Life Improvement and National Defense "
+            "Authorization Act for Fiscal Year 2025 (Public Law 118–159) is amended—</text><paragraph>"
+            "<enum>(1)</enum><text>in section 1412(b)(2) (50 U.S.C. 98b note), by striking <quote>section 111 of the "
+            "National Environmental Policy Act of 1969 (42 U.S.C. 4336e)</quote> and inserting <quote>section 3 of "
+            "the National Environmental Policy Act of 1969</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        target = bill.instructions[0].target
+        self.assertEqual((target.section, target.path, target.title, target.usc_section, target.is_note),
+                         ("1412", [("subsection", "b"), ("paragraph", "2")], 50, "98b", True))
+        self.assertEqual(bill.titles(), [50])
+        outcome = apply_bill(bill, {50: CodeTitle(code)})
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        doc = find_doc(outcome, "50 U.S.C. § 98b note (Pub. L. 118-159, § 1412)")
+        self.assertIn("[+section 3 of the National Environmental Policy Act of 1969+]",
+                      marked(doc.root.children[0].children[0].body))
+
 
 class CreditTests(unittest.TestCase):
     def test_public_law(self):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from xml.etree import ElementTree as ET
 
 from .statute import LEVELS, Node, Text, INS, norm
@@ -293,6 +293,25 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
         return path, within, heading, text
 
 
+_SECTION_CITED = re.compile(rf"^in section (?P<section>\w+)(?P<path>(?:\(\w+\))*) {_CITE}(?:, |—|$)")
+
+
+def _locate_section(target: Target, text: str) -> tuple[Target, str]:
+    """Handle "in section 1412(b)(2) (50 U.S.C. 98b note)," under a lead-in that names the Act without a
+    section, as in "The … Act (Public Law 118–159) is amended—". Each instruction then gets its own section,
+    and its own Code citation when the Act was cited only by Public Law, so the right title is searched."""
+    match = _SECTION_CITED.match(text)
+    if not match or target.section or target.chapter or target.name.startswith("title "):
+        return target, text
+    located = replace(target, section=match.group("section"),
+                      path=target.path + _level_for(_parts_of(match.group("path")), "section"))
+    usc = re.fullmatch(r"(\d+) U\.S\.C\. (\w+)(?:\([^)]*\))*( note)?", match.group("cite"))
+    if usc and target.title is None:
+        located.title, located.usc_section = int(usc.group(1)), usc.group(2)
+        located.is_note = located.is_note or bool(usc.group(3))
+    return located, text[match.end():]
+
+
 def _each_paths(kind: str, text: str) -> tuple | None:
     """The places named by "in each of paragraphs (3), (4)(B), and (6) through (8)", as relative paths."""
     paths: list[tuple] = []
@@ -551,7 +570,8 @@ class _Parser:
             self.bill.problems.append(ParseProblem(_cite(cite), "", "instruction has no text"))
             return
         text, quotes = tokenize(text_el)
-        located, more_within, heading, rest = _parse_locators(text)
+        target, rest = _locate_section(target, text)
+        located, more_within, heading, rest = _parse_locators(rest)
         children = [c for c in el if c.tag in _PARTS]
         if not rest and children:
             for child in children:

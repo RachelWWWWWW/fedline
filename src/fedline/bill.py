@@ -426,6 +426,21 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     text = _AS_NOTE.sub("", text)
     kinds = "|".join(_LEVEL_WORDS)
 
+    # A span from the matter preceding the first subdivision into a later one: "by striking “the later of” in
+    # the matter preceding subclause (I) and all that follows through the semicolon at the end of subclause
+    # (II)", "… through “(A) the” in subparagraph (A)".
+    match = re.fullmatch(
+        rf"by striking ⟦(?P<a>\d+)⟧ in the matter preceding (?P<k1>{kinds}) \((?P<v1>\w+)\) and all that follows "
+        rf"through (?:⟦(?P<c>\d+)⟧ in (?P<k2>{kinds}) \((?P<v2>\w+)\)|the (?P<pc>{punct}) at the end of "
+        rf"(?P<k3>{kinds}) \((?P<v3>\w+)\))(?: and inserting {new})?", text)
+    if match:
+        return "replace_across", {
+            "start": q(match, "a"), "first": (_LEVEL_WORDS[match.group("k1")], match.group("v1")),
+            "end": q(match, "c") if match.group("c") else None,
+            "end_punct": _PUNCTUATION.get(match.group("pc") or ""),
+            "last": (_LEVEL_WORDS[match.group("k2") or match.group("k3")], match.group("v2") or match.group("v3")),
+            "new": new_text(match)}
+
     match = re.fullmatch(rf"by striking ({kinds}) (.+?) and inserting the following:?", text)
     if match and blocks:
         kind = _LEVEL_WORDS[match.group(1)]

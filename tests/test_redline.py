@@ -416,6 +416,78 @@ class MoreShapesTests(unittest.TestCase):
         self.assertIn("isn't a subsection with text after its designation", outcome.flags[0].message)
 
 
+class SpanAcrossTests(unittest.TestCase):
+    """S. 5653 §§ 2101(b)(2)(B)(ii) and 2101(g)(2)(C): spans from the matter preceding the first subdivision
+    into a later one."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s824p"><num value="824p">§ 824p.</num>'
+            '<subsection><num value="c">(c)</num><chapeau>The State has not acted by 1 year after the later of—'
+            '</chapeau><paragraph><num value="1">(1)</num><content>the date filed; and</content></paragraph>'
+            '<paragraph><num value="2">(2)</num><content>the date designated;</content></paragraph></subsection>'
+            '<subsection><num value="d">(d)</num><chapeau>The States are in disagreement after the later of—'
+            '</chapeau><subparagraph><num value="A">(A)</num><content>the date that is 1 year after filing; and'
+            '</content></subparagraph><subparagraph><num value="B">(B)</num><content>the date of designation.'
+            '</content></subparagraph></subsection>'
+            '<sourceCredit>(June 10, 1920, ch. 285, pt. II, § 216.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, instruction):
+        bill = parse_sections("<section><enum>2.</enum><text>Section 216 of the Federal Power Act (16 U.S.C. 824p) "
+                              f"is amended {instruction}</text></section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        self.assertIn("Original text in the redline matches the source XML in every section.", verify(bill, outcome))
+        docs = [d for d in outcome.documents if d.title == "16 U.S.C. § 824p"]
+        return bill, outcome, docs[0].root if docs else None
+
+    def test_through_the_punctuation_at_the_end_of_the_last_subdivision(self):
+        _, outcome, root = self.run_bill(
+            "in subsection (c), by striking <quote>the later of</quote> in the matter preceding paragraph (1) and all "
+            "that follows through the semicolon at the end of paragraph (2) and inserting <quote>the date filed "
+            "with the State;</quote>.")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        subsection = root.live_child("c")
+        self.assertEqual(marked(subsection.body), "The State has not acted by 1 year after [-the later of—-][+the date "
+                                                  "filed with the State;+]")
+        self.assertTrue(all(c.deleted for c in subsection.children))
+
+    def test_through_a_designation_and_the_words_after_it(self):
+        bill, outcome, root = self.run_bill(
+            "in subsection (d), by striking <quote>in disagreement</quote> in the matter preceding subparagraph (A) "
+            "and all that follows through <quote>(A) the</quote> in subparagraph (A) and inserting <quote>unable to "
+            "agree by the</quote>.")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        subsection = root.live_child("d")
+        first, second = subsection.children
+        self.assertEqual(marked(subsection.body), "The States are [-in disagreement after the later of—-][+unable to "
+                                                  "agree by the+]")
+        self.assertEqual((marked(first.label), marked(first.body), first.run_in),
+                         ("[-(A)-]", "[-the-] date that is 1 year after filing; and", True))
+        self.assertFalse(second.deleted)
+        # In the document, what's left of (A) finishes the sentence on the same line.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "ih", verify(bill, outcome))
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        paragraphs = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<w:p>.*?</w:p>", document)]
+        self.assertIn("(d) The States are in disagreement after the later of—unable to agree by the (A) the date that "
+                      "is 1 year after filing; and", paragraphs)
+        self.assertIn("(B) the date of designation.", paragraphs)
+
+    def test_the_start_must_be_before_the_first_subdivision(self):
+        _, outcome, _ = self.run_bill(
+            "in subsection (d), by striking <quote>in disagreement</quote> in the matter preceding subparagraph (B) "
+            "and all that follows through <quote>(B) the</quote> in subparagraph (B).")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("subparagraph (B) isn't the first subdivision", outcome.flags[0].message)
+
+    def test_an_end_that_isnt_there_isnt_guessed(self):
+        _, outcome, _ = self.run_bill(
+            "in subsection (d), by striking <quote>in disagreement</quote> in the matter preceding subparagraph (A) "
+            "and all that follows through <quote>nowhere</quote> in subparagraph (B).")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("“nowhere” wasn't found exactly once", outcome.flags[0].message)
+
+
 class StatutesAtLargeTests(unittest.TestCase):
     """S. 5653 § 2212: "The Act of February 5, 1948 (62 Stat. 17, chapter 45), is amended— (1) in the first
     section (62 Stat. 17, chapter 45; 25 U.S.C. 323), …"."""

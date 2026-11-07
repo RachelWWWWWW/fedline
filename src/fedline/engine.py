@@ -444,6 +444,8 @@ class Engine:
             return self._replace_at_end(inst, doc, node)
         if action == "replace_span":
             return self._replace_span(inst, doc, node)
+        if action == "replace_across":
+            return self._replace_across(inst, doc, node)
         if action in ("replace_sentence", "insert_after_sentence"):
             return self._edit_sentence(inst, doc, node)
         if action == "delete_nodes":
@@ -679,6 +681,60 @@ class Engine:
             raise _NotApplied(f"Not applied: “{old}” at the end of {_describe(node, doc)} doesn't follow "
                               f"“{after}”.", doc, node)
         _swap(text, start, len(current), new, inst.cite)
+        return True
+
+    def _replace_across(self, inst, doc, node) -> bool:
+        """'By striking "the later of" in the matter preceding subclause (I) and all that follows through the
+        semicolon at the end of subclause (II)': from text before the first subdivision into a later one. The
+        rest of the introductory text and the subdivisions before the last go. The last one goes too, or, when
+        the span ends partway into it, its designation and its text up to there, and the rest runs on."""
+        args = inst.args
+        live = [c for c in node.children if not c.deleted and c.kind != "continuation"]
+        first_kind, first_value = args["first"]
+        if not live or (live[0].kind, live[0].value) != (first_kind, first_value):
+            raise _NotApplied(f"Not applied: {first_kind} ({first_value}) isn't the first subdivision of "
+                              f"{_describe(node, doc)}.", doc, node)
+        last = node.live_child(args["last"][1], args["last"][0])
+        if last is None:
+            raise _NotApplied(f"Not applied: {args['last'][0]} ({args['last'][1]}) wasn't found under "
+                              f"{_describe(node, doc)}.", doc, node)
+        if any(not c.deleted for c in last.children):
+            raise _NotApplied(f"Not applied: the span ends in {_describe(last, doc)}, which has subdivisions of its "
+                              "own.", doc, node)
+        intro = node.body
+        hits = self._find(inst, args["start"], [(intro, 0, len(intro.current()))], doc, node)
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{args['start']}” {problem} in the matter preceding {first_kind} "
+                              f"({first_value}) of {_describe(node, doc)}.", doc, node)
+        body = last.body.current()
+        if args["end"] is None:
+            if not body.rstrip().endswith(args["end_punct"]):
+                raise _NotApplied(f"Not applied: {_describe(last, doc)} doesn't end with “{args['end_punct']}”.",
+                                  doc, node)
+            stop = len(body)
+        else:
+            label = last.label.current().strip()
+            end = args["end"]
+            if label and end.startswith(label) and body.startswith(end[len(label):].lstrip()):
+                stop = len(end[len(label):].lstrip())  # "(A) the": the designation and the first word
+            else:
+                ends = self._find(inst, end, [(last.body, 0, len(body))], doc, node)
+                if len(ends) != 1:
+                    raise _NotApplied(f"Not applied: “{end}” wasn't found exactly once in {_describe(last, doc)}.",
+                                      doc, node)
+                stop = ends[0][1].end()
+        _swap(intro, hits[0][1].start(), len(intro.current()), args["new"], inst.cite)
+        for child in node.children[:next(i for i, c in enumerate(node.children) if c is last)]:
+            if not child.deleted:
+                child.delete(inst.cite)
+        if not body[stop:].strip():
+            last.delete(inst.cite)
+            return True
+        last.label.delete_all(inst.cite)
+        last.heading.delete_all(inst.cite)
+        last.body.strike(0, stop, inst.cite)
+        last.run_in = True
         return True
 
     def _replace_at_end_with_block(self, inst, doc, node) -> bool:

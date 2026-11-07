@@ -124,6 +124,9 @@ class Node:
     moved_by: str = field(default="", compare=False)
     # The kind before a redesignation changed it, as when subsections become paragraphs.
     original_kind: str = field(default="", compare=False)
+    # Set when the bill strikes this provision's designation but keeps the rest of its text, which then runs
+    # on in the text before it, as when a span ends partway into it.
+    run_in: bool = field(default=False, compare=False)
 
     def texts(self, headings: bool = True):
         """Yield this subtree's text blocks in reading order."""

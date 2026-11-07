@@ -134,6 +134,17 @@ class Writer:
             if ghost:
                 self._ghost_lines(child, lines, indent, child.moved_by)
                 continue
+            if child.run_in and lines and lines[-1].flag is None and lines[-1].pieces:
+                # Its designation is struck, and its text finishes the sentence before it.
+                before = len(lines)
+                self._lines(child, flags, lines, parent_indent=indent)
+                own, lines[before:] = lines[before:], []
+                for line in own:
+                    if line.flag is None and line.pieces:
+                        lines[before - 1].pieces += [_Piece(" ", ORIG, (), False)] + line.pieces
+                    else:
+                        lines.append(line)
+                continue
             if child.kind == "continuation":
                 # Text between subdivisions lines up with the text that introduced them.
                 text = self._pieces(child.body)

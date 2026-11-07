@@ -351,6 +351,8 @@ class Engine:
             return True
         if action == "replace_with_block":
             return self._replace_with_block(inst, doc, node)
+        if action == "replace_opening":
+            return self._replace_opening(inst, doc, node)
         if action == "rewrite":
             block = args["blocks"][0]
             # A Code section's root carries its Code number, not the Act's, so only its kind can be compared.
@@ -570,13 +572,67 @@ class Engine:
         if block.body.current() != rest:
             _swap(node.body, 0, len(rest), block.body.current(), inst.cite)
 
+    def _replace_opening(self, inst, doc, node) -> bool:
+        """'By striking the section designation and all that follows through "All agencies" and inserting the
+        following:'. The provision's heading and opening text up to that phrase are replaced by the new
+        provision's, which may break the rest of the text into subdivisions."""
+        block = inst.args["blocks"][0]
+        if node.kind != inst.args["unit"] or block.kind != node.kind or (
+                node is not doc.root and block.value != node.value):
+            raise _NotApplied(f"Not applied: the new {block.kind} ({block.value}) doesn't replace "
+                              f"{_describe(node, doc)}.", doc, node)
+        end, n = inst.args["end"], inst.args["n"]
+        body = node.body.current()
+        start, stop = 0, len(body)
+        if n:
+            spans = _sentences(body)
+            if n > len(spans):
+                raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't have a {_ordinal(n)} sentence.",
+                                  doc, node)
+            start, stop = spans[n - 1]
+        ends = [m for m in _word_matches(end, body) if start <= m.start() and m.end() <= stop]
+        if not ends:
+            raise _NotApplied(f"Not applied: “{end}” wasn't found in the opening text of {_describe(node, doc)}.",
+                              doc, node)
+        if block.children and any(c.label.before() for c in node.children if not c.deleted):
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} already has subdivisions, and the instruction "
+                              "doesn't say whether they move under the new ones.", doc, node)
+        # A heading the bill supplies replaces the existing one. Without one, a heading in a title that isn't
+        # positive law stays: it's an editors' catchline, not text of the Act that the bill strikes. Elsewhere
+        # the heading is enacted text inside the struck span, so it goes.
+        title = self.titles.get(doc.order[0]) if doc.basis == "code" else None
+        catchline = title is not None and not title.positive_law
+        if block.heading.current() and block.heading.current() != node.heading.current():
+            node.heading.delete_all(inst.cite)
+            node.heading.segments += block.heading.segments
+        elif not block.heading.current() and node.heading.current() and not catchline:
+            node.heading.delete_all(inst.cite)
+            self._flag(inst.cite, f"The heading of {_describe(node, doc)} is struck: it's enacted text within the "
+                                  "struck span, and the new text has no heading. Check this one.", False, doc, node)
+        node.body.strike(0, ends[0].end(), inst.cite)
+        rest = node.body.cut(0)
+        node.body.segments += block.body.segments
+        if block.children:
+            last = block.children[-1]
+            while last.children:
+                last = last.children[-1]
+            last.body.segments += rest.segments
+            node.children[0:0] = block.children
+        else:
+            node.body.segments += rest.segments
+        self._check_duplicates(inst, doc, node)
+        return True
+
     def _split_into(self, inst, doc, node, old, blocks, at_start) -> None:
         """Strike old from node's introductory text and put blocks in its place as new subdivisions, moving
-        the text that followed old into the last of them."""
+        the text that followed old into the last of them. New provisions at node's own level, as in 'in
+        paragraph (1), by striking "to promote" and inserting (2) to promote', follow node instead."""
         if any(c.label.before() for c in node.children if not c.deleted):
             raise _NotApplied(f"Not applied: {_describe(node, doc)} already has subdivisions, and the instruction "
                               "doesn't say whether they move under the new ones.", doc, node)
-        if any(b.kind == node.kind for b in blocks):
+        siblings = all(b.kind == node.kind for b in blocks)
+        parent = next((p for p in _walk_nodes(doc.root) if node in p.children), None) if siblings else None
+        if any(b.kind == node.kind for b in blocks) and (parent is None or node.children):
             raise _NotApplied(f"Not applied: the new {blocks[0].kind} can't go inside {_describe(node, doc)}.",
                               doc, node)
         text = node.body
@@ -594,6 +650,11 @@ class Engine:
         while last.children:
             last = last.children[-1]
         last.body.segments += rest.segments
+        if parent is not None:
+            position = parent.children.index(node) + 1
+            parent.children[position:position] = blocks
+            self._check_duplicates(inst, doc, parent)
+            return
         node.children[0:0] = blocks
         self._check_duplicates(inst, doc, node)
 

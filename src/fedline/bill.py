@@ -404,6 +404,13 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
     if match:
         return "insert_after_sentence", {"n": _ORDINALS[match.group(1)], "new": q(match, "b")}
 
+    match = re.fullmatch(
+        r"by striking the (?P<unit>section|subsection|paragraph|subparagraph) (?:heading and )?designation and all "
+        rf"that follows through ⟦(?P<c>\d+)⟧(?: in the (?P<n>{_ORDINAL}) sentence)? and inserting the following:?", text)
+    if match and len(blocks) == 1:
+        return "replace_opening", {"unit": match.group("unit"), "end": q(match, "c"),
+                                   "n": _ORDINALS.get(match.group("n") or ""), "blocks": blocks}
+
     match = re.fullmatch(r"to read as follows:?", text)
     if match and len(blocks) == 1:
         return "rewrite", {"blocks": blocks}

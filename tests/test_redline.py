@@ -576,6 +576,64 @@ class BlockTests(unittest.TestCase):
             self.apply(node, "(t) Nothing in this section", [new_node("subsection", "u", "Savings", "Nothing")])
 
 
+class OpeningTests(unittest.TestCase):
+    def apply(self, node, end, block, n=None, unit="section", positive_law=False):
+        doc = SimpleNamespace(title="Test", root=node, basis="code", order=(30, (226, ""), 0))
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_opening",
+                           args={"unit": unit, "end": end, "n": n, "blocks": [block]})
+        engine = Engine(SimpleNamespace(), {30: SimpleNamespace(positive_law=positive_law, release_point="")})
+        engine._operate(inst, doc, node)
+        return engine.outcome.flags
+
+    def test_designation_span_restructures_the_opening(self):  # NEPA § 2, 42 U.S.C. 4321
+        node = Node("section", "4321", label=Text("§ 4321."), heading=Text("Declaration of purpose"),
+                    body=Text("The purposes of this chapter are: To declare a policy; to promote efforts."))
+        block = Node("section", "2", label=Text("Sec. 2.", INS), heading=Text("Purposes", INS), children=[
+            new_node("subsection", "a", "Purposes", "The purposes of this Act are—", [
+                new_node("paragraph", "1", "", "to declare")])])
+        self.apply(node, "are: To declare", block)
+        self.assertEqual(marked(node.label), "§ 4321.")
+        self.assertEqual(marked(node.heading), "[-Declaration of purpose-][+Purposes+]")
+        self.assertEqual(marked(node.body), "[-The purposes of this chapter are: To declare-]")
+        paragraph = node.children[0].children[0]
+        self.assertEqual(marked(paragraph.body), "[+to declare+] a policy; to promote efforts.")
+        self.assertEqual(node.before_text(), "§ 4321.Declaration of purposeThe purposes of this chapter are: To "
+                                             "declare a policy; to promote efforts.")
+
+    def test_code_catchline_stays_when_the_bill_gives_no_heading(self):  # 30 U.S.C. 226(g)
+        node = Node("subsection", "g", label=Text("(g)"), heading=Text("Regulation of activities"),
+                    body=Text("The Secretary of the Interior, or the Secretary of Agriculture, shall act. Then more."))
+        block = new_node("subsection", "g", children=[new_node("paragraph", "1", "", "The Secretary of the Interior, or")])
+        self.apply(node, "Secretary of the Interior, or", block, n=1, unit="subsection")
+        self.assertEqual(marked(node.heading), "Regulation of activities")
+        self.assertEqual(marked(node.children[0].body),
+                         "[+The Secretary of the Interior, or+] the Secretary of Agriculture, shall act. Then more.")
+
+    def test_heading_in_a_positive_law_title_is_struck_and_noted(self):  # e.g. 54 U.S.C.
+        node = Node("subsection", "a", label=Text("(a)"), heading=Text("In general"), body=Text("Property may be listed."))
+        block = new_node("subsection", "a", children=[new_node("paragraph", "1", "", "Property")])
+        flags = self.apply(node, "Property", block, unit="subsection", positive_law=True)
+        self.assertEqual(marked(node.heading), "[-In general-]")
+        self.assertEqual([(f.blocking, "heading" in f.message) for f in flags], [(False, True)])
+
+    def test_end_phrase_must_be_in_the_named_sentence(self):
+        node = Node("subsection", "g", label=Text("(g)"), body=Text("First sentence. The Secretary acts."))
+        with self.assertRaises(_NotApplied):
+            self.apply(node, "The Secretary", new_node("subsection", "g", body="New"), n=1, unit="subsection")
+
+    def test_new_provision_at_the_same_level_follows_the_original(self):  # NEPA § 1101(2)(A)
+        parent = Node("subsection", "a", label=Text("(a)"), children=[
+            Node("paragraph", "1", label=Text("(1)", INS), body=Text("to declare a policy; to promote efforts."))])
+        doc = SimpleNamespace(title="Test", root=parent)
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[("paragraph", "1")], action="replace_with_block",
+                           args={"old": "to promote", "blocks": [new_node("paragraph", "2", "", "to promote")]})
+        engine = Engine(SimpleNamespace(), {})
+        engine._operate(inst, doc, engine._walk(parent, inst.path, inst, doc))
+        first, second = parent.children
+        self.assertEqual(marked(first.body), "to declare a policy; [-to promote-]")
+        self.assertEqual((second.value, marked(second.body)), ("2", "[+to promote+] efforts."))
+
+
 class RewriteTests(unittest.TestCase):
     def test_rewrite_keeps_the_designation_and_replaces_the_rest(self):
         old = Node("section", "4336c", label=Text("§ 4336c."), heading=Text("Old"), body=Text("Old text."),

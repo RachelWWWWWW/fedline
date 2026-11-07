@@ -312,6 +312,12 @@ class CodeTitle:
                 self.release_point = (el.text or "").split("@")[-1].strip()
             if self.number and self.release_point:
                 break
+        # In a positive-law title the Code is the law, headings included. In the others it's a compilation,
+        # and headings the Acts don't have are the editors' catchlines.
+        meta = next((el for el in self.root if _local(el) == "meta"), None)
+        self.positive_law = meta is not None and any(
+            _local(el) == "property" and el.get("role") == "is-positive-law" and (el.text or "").strip() == "yes"
+            for el in meta)
         self.sections: dict[str, ET.Element] = {}
         for el in self.root.iter(f"{{{self.ns}}}section"):
             identifier = el.get("identifier") or ""

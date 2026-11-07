@@ -35,7 +35,6 @@ The run ends with a count, such as `179 of 236 instructions applied; 58 not appl
 ## Current limits
 
 - Instructions are parsed by pattern matching. Wording the parser doesn't recognize is flagged and listed, not applied. The LLM step for harder wording isn't built yet. Wording not yet recognized includes:
-  - spans that start at a designation or heading, such as "by striking the section designation and all that follows through"
   - "in the first proviso"
   - indenting, and moving text. Nothing is shown in the "moved" format yet.
 - When the Code's editors changed the Act's wording, for example printing "subchapter II of this chapter" for the Act's "title II of this Act", the bill's quoted text isn't found in the Code. The instruction is flagged, not applied.

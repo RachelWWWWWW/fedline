@@ -112,6 +112,7 @@ Suggested order:
 
 # Future work
 - Mac or multisystem support
+- Develop a GUI
 - Web or intra-net visible interface for making available to other users. Hosted on GitHub or similar lightweight hosting is fine.
 - Automatically start a new folder for each bill, store the deliverable into the correct folder.
 - One click re-run when a bill is updated.

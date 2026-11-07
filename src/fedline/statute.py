@@ -388,17 +388,29 @@ class CodeTitle:
                 return self._note_document(number, note, quoted, act_name)
         return None
 
-    def note_for_public_law(self, public_law: str, section: str) -> Document | None:
-        """Find a public law section reproduced in the notes of any section of this title."""
+    def note_for_public_law(self, public_law: str, section: str,
+                            path: tuple[str, ...] = ()) -> tuple[Document, int] | None:
+        """Find a public law section reproduced in the notes of any section of this title.
+
+        A note may reproduce only part of the section, as in origin ".../s3511/c" for subsection (c). That
+        note is used when the instruction's path, given as designations, starts with that part. Returns the
+        note and how many leading steps of the path it covers. A note of the whole section is preferred."""
         congress, law = public_law.split("-")
-        pattern = rf"/us/pl/{congress}/{law}(/.*)?/s{re.escape(section)}$"
+        pattern = rf"/us/pl/{congress}/{law}(?:/.*)?/s{re.escape(section)}(?P<part>(?:/\w+)*)"
+        partial = None
         for number, el in self.sections.items():
             for note in el.iter(f"{{{self.ns}}}note"):
                 quoted = note.find(f".//{{{self.ns}}}quotedContent")
-                if quoted is not None and re.fullmatch(pattern, quoted.get("origin") or ""):
-                    name = f"Pub. L. {public_law}, § {section}"
-                    return self._note_document(number, note, quoted, name)
-        return None
+                match = re.fullmatch(pattern, quoted.get("origin") or "") if quoted is not None else None
+                if not match:
+                    continue
+                part = tuple(match.group("part").split("/")[1:])
+                if not part:
+                    return self._note_document(number, note, quoted, f"Pub. L. {public_law}, § {section}"), 0
+                if partial is None and path[:len(part)] == part:
+                    name = f"Pub. L. {public_law}, § {section}" + "".join(f"({p})" for p in part)
+                    partial = self._note_document(number, note, quoted, name), len(part)
+        return partial
 
     def _note_document(self, number: str, note: ET.Element, quoted: ET.Element, name: str) -> Document:
         root = Node(kind="note")

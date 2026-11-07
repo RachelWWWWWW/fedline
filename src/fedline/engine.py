@@ -179,15 +179,19 @@ class Engine:
         self.act_names.setdefault(name, key)
         return self.acts[key]
 
-    def _note(self, target: Target) -> Document | None:
-        key = f"{target.name}|{target.cite}|{target.section}"
+    def _note(self, target: Target, path: list) -> tuple[Document | None, int]:
+        """The Code note for a target, and how many leading steps of the path the note itself stands for,
+        when it reproduces only part of a section."""
+        values = tuple(step[1] for step in path if isinstance(step[1], str))
+        key = f"{target.name}|{target.cite}|{target.section}|{values}"
         if key in self.notes:
             return self.notes[key]
-        doc = None
+        doc, depth = None, 0
         if target.public_law:
             for title in self.titles.values():
-                doc = title.note_for_public_law(target.public_law, target.section or "")
-                if doc:
+                found = title.note_for_public_law(target.public_law, target.section or "", values)
+                if found:
+                    doc, depth = found
                     break
         if doc is None and target.usc_section:
             title = self.titles.get(target.title)
@@ -195,8 +199,8 @@ class Engine:
                 doc = title.note_for_act(target.usc_section, target.name)
         if doc is not None:
             doc = self.docs.setdefault(doc.key, doc)
-            self.notes[key] = doc
-        return doc
+            self.notes[key] = doc, depth
+        return doc, depth
 
     def _direct(self, target: Target) -> Document | None:
         title = self.titles.get(target.title)
@@ -246,11 +250,12 @@ class Engine:
         return self._apply_act(inst)
 
     def _apply_note(self, inst: Instruction) -> bool:
-        doc = self._note(inst.target)
+        path = list(inst.target.path) + inst.path
+        doc, depth = self._note(inst.target, path)
         if doc is None:
             return self._not_redlined(inst, f"{inst.target.name} wasn't found in the Code notes")
         root = doc.root
-        path = list(inst.target.path) + inst.path
+        path = path[depth:]
         section = root.live_child(inst.target.section or "", "section")
         if section is not None:
             root = section

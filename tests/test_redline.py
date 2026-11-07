@@ -351,6 +351,39 @@ class NoteLookupTests(unittest.TestCase):
         self.assertIn("[+section 3 of the National Environmental Policy Act of 1969+]",
                       marked(doc.root.children[0].children[0].body))
 
+    # The Code reproduces only subsection (c) of Pub. L. 118–159 § 3511, in a note to 46 U.S.C. 50505.
+    PART_CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>46</docNumber></meta><main>'
+                 '<section identifier="/us/usc/t46/s50505"><num value="50505">§ 50505.</num><content>Text.</content>'
+                 '<sourceCredit>(Pub. L. 109–304, § 8.)</sourceCredit><notes><note topic="miscellaneous">'
+                 '<heading>Categorical Exclusions</heading><p>Pub. L. 118–159, div. C, title XXXV, § 3511(c), provided '
+                 'that:<quotedContent origin="/us/pl/118/159/dC/tXXXV/s3511/c"><paragraph><num value="3">“(3)</num>'
+                 '<heading> Definitions.—</heading><subparagraph><num value="A">“(A)</num><content> The term '
+                 '“categorical exclusion” has the meaning given in section 111 of the National Environmental Policy '
+                 'Act of 1969 (42 U.S.C. 4336e).</content></subparagraph></paragraph></quotedContent></p></note>'
+                 '</notes></section></main></uscDoc>').encode()
+
+    def run_part(self, locator):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>The Servicemember Quality of Life Improvement and National Defense "
+            "Authorization Act for Fiscal Year 2025 (Public Law 118–159) is amended—</text><paragraph>"
+            f"<enum>(1)</enum><text>in section {locator} (46 U.S.C. 50505 note), by striking <quote>section 111 of "
+            "the National Environmental Policy Act of 1969 (42 U.S.C. 4336e)</quote> and inserting <quote>section 3 "
+            "of the National Environmental Policy Act of 1969</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        return apply_bill(bill, {46: CodeTitle(self.PART_CODE)})
+
+    def test_a_note_of_part_of_a_section_is_found_from_the_path(self):
+        outcome = self.run_part("3511(c)(3)(A)")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        doc = find_doc(outcome, "46 U.S.C. § 50505 note (Pub. L. 118-159, § 3511(c))")
+        self.assertIn("[+section 3 of the National Environmental Policy Act of 1969+]",
+                      marked(doc.root.children[0].children[0].body))
+
+    def test_a_note_of_another_part_of_the_section_isnt_used(self):
+        outcome = self.run_part("3511(d)(3)(A)")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("wasn't found in the Code notes", outcome.flags[0].message)
+
 
 class CreditTests(unittest.TestCase):
     def test_public_law(self):

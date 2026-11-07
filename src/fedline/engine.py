@@ -109,6 +109,14 @@ _CODE_WORDING = [
     (re.compile(r"(?<![\w(–-])(?P<num>\d+[A-Za-z]?(?:–\d+)?)(?P<parts>" + _PARTS_RE + r")(?![\w–-])"), _bare_number),
     (re.compile(r"['’]"), lambda m, n, e: "['’]"),
     (re.compile(r"[\"“”]"), lambda m, n, e: "[\"“”]"),
+    # The Code drops the enacting "That" that opens a section, and "hereby": "That the Secretary … be, and he
+    # is hereby, empowered" prints as "The Secretary … be, and he is empowered".
+    # Without "That", the next word starts the sentence, so it's capitalized.
+    (re.compile(r"That ([a-z])"),
+     lambda m, n, e: f"(?:That {m[1]}|{m[1].upper()})" if m.start() == 0 else None),
+    (re.compile(r" hereby,?(?= )"), lambda m, n, e: r"(?: hereby,?)?"),
+    # It adds Code citations in brackets after a law it names: "…, as amended [25 U.S.C. 5101 et seq.];".
+    (re.compile(r"\)|as amended\b"), lambda m, n, e: re.escape(m[0]) + r"(?: \[[^\]]*U\.S\.C\.[^\]]*\])?"),
 ]
 
 
@@ -758,6 +766,8 @@ class Engine:
         existing text into subdivisions: the struck text is replaced by the new ones, and the text that
         followed it continues as the text of the last of them."""
         old, blocks, lead = inst.args["old"], inst.args["blocks"], inst.args.get("lead", "")
+        if node is doc.root and len(blocks) == 1 and blocks[0].kind == node.kind == "section" and not lead:
+            return self._restate_section(inst, doc, node, old, blocks[0])
         if not old.startswith("("):
             self._split_into(inst, doc, node, old, blocks, at_start=False, lead=lead)
             return True
@@ -785,6 +795,30 @@ class Engine:
             raise _NotApplied(f"Not applied: the new {block.kind} ({block.value}) doesn't match {_describe(node, doc)} "
                               "or any of its subdivisions.", doc, node)
         self._overlay(inst, doc, target, old, block)
+        return True
+
+    def _restate_section(self, inst, doc, node, old, block) -> bool:
+        """'In the first section, by striking "That the Secretary … empowered to" and inserting SEC. 1.
+        Rights-of-way … The Secretary of the Interior may' (S. 5653 § 2212(1)): the new section is the same
+        one, with a heading and new opening words. The heading replaces the section's, and the new words
+        replace the struck ones; the rest of the text stays."""
+        unlabeled = [c for c in block.children if not c.label.current() and not c.heading.current()]
+        if block.body.current() and not block.children:
+            words = block.body
+        elif not block.body.current() and len(block.children) == 1 and unlabeled and not unlabeled[0].children:
+            words = unlabeled[0].body  # bills set a section's text out as a subsection with no designation
+        else:
+            raise _NotApplied(f"Not applied: the new section has subdivisions, so it doesn't just restate the opening "
+                              f"of {_describe(node, doc)}.", doc, node)
+        hits = self._find(inst, old, self._scope(inst, doc, node), doc, node)
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{old}” {problem} in {_describe(node, doc)}.", doc, node)
+        text, match = hits[0]
+        if block.heading.current() and block.heading.current() != node.heading.current():
+            node.heading.delete_all(inst.cite)
+            node.heading.segments += block.heading.segments
+        _swap(text, match.start(), match.end(), words.current(), inst.cite)
         return True
 
     def _overlay(self, inst, doc, node, old, block) -> None:

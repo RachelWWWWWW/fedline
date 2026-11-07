@@ -416,6 +416,65 @@ class MoreShapesTests(unittest.TestCase):
         self.assertIn("isn't a subsection with text after its designation", outcome.flags[0].message)
 
 
+class StatutesAtLargeTests(unittest.TestCase):
+    """S. 5653 § 2212: "The Act of February 5, 1948 (62 Stat. 17, chapter 45), is amended— (1) in the first
+    section (62 Stat. 17, chapter 45; 25 U.S.C. 323), …"."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>25</docNumber></meta><main>'
+            '<section identifier="/us/usc/t25/s323"><num value="323">§ 323.</num><heading>Rights-of-way across any '
+            'Indian lands</heading><content>The Secretary of the Interior be, and he is empowered to grant '
+            'rights-of-way.</content><sourceCredit>(Feb. 5, 1948, ch. 45, § 1, 62 Stat. 17.)</sourceCredit></section>'
+            '<section identifier="/us/usc/t25/s324"><num value="324">§ 324.</num><content>No grant over lands of a '
+            'tribe organized under the Act of June 18, 1934 (48 Stat. 984), as amended [25 U.S.C. 5101 et seq.], '
+            'shall be made without consent.</content><sourceCredit>(Feb. 5, 1948, ch. 45, § 2, 62 Stat. 18.)'
+            '</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum>{text}</paragraph>" for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>The Act of February 5, 1948 (62 Stat. 17, chapter 45), "
+                              f"is amended—</text>{items}</section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {25: CodeTitle(self.CODE)})
+        self.assertIn("Original text in the redline matches the source XML in every section.", verify(bill, outcome))
+        return bill, outcome
+
+    def test_each_instruction_gives_the_code_citation(self):
+        bill, outcome = self.run_bill(
+            "<text>in the first section (62 Stat. 17, chapter 45; 25 U.S.C. 323), by striking <quote>That the "
+            "Secretary of the Interior be, and he is hereby, empowered to</quote> and inserting the following:"
+            "</text><quoted-block><section><enum>1.</enum><header>Rights-of-way across Indian land</header>"
+            "<subsection><enum /><text>The Secretary of the Interior may</text></subsection></section>"
+            "</quoted-block>",
+            "<text>in section 2 (62 Stat. 18, chapter 45; 25 U.S.C. 324), by striking <quote>organized under the Act "
+            "of June 18, 1934 (48 Stat. 984), as amended,</quote>.</text>",
+            "<text>by adding at the end the following:</text><quoted-block><section><enum>8.</enum><header>Tribal "
+            "grants</header><text>A tribe may grant a right-of-way.</text></section></quoted-block>")
+        self.assertEqual(bill.titles(), [25])
+        self.assertEqual([(i.target.section, i.target.usc_section) for i in bill.instructions],
+                         [("1", "323"), ("2", "324"), (None, None)])
+        self.assertEqual((outcome.applied, outcome.failed), (3, 0))
+        first = find_doc(outcome, "25 U.S.C. § 323").root
+        self.assertEqual(marked(first.heading),
+                         "[-Rights-of-way across any Indian lands-][+Rights-of-way across Indian land+]")
+        self.assertEqual(marked(first.body), "[-The Secretary of the Interior be, and he is empowered to-][+The "
+                                             "Secretary of the Interior may+] grant rights-of-way.")
+        self.assertEqual(marked(find_doc(outcome, "25 U.S.C. § 324").root.body),
+                         "No grant over lands of a tribe[- organized under the Act of June 18, 1934 (48 Stat. 984), as "
+                         "amended [25 U.S.C. 5101 et seq.],-] shall be made without consent.")
+        find_doc(outcome, "New § 8 of the Act of February 5, 1948 (no Code section number yet)")
+        self.assertEqual([f.blocking for f in outcome.flags], [False, False])  # the two reworded matches
+
+    def test_without_a_code_citation_the_act_isnt_found(self):
+        _, outcome = self.run_bill("<text>in section 2, by striking <quote>without consent</quote>.</text>")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("couldn't be mapped to Code sections", outcome.flags[0].message)
+
+    def test_the_enacting_that_is_optional_only_at_the_start(self):
+        pattern = _code_wording("That the Secretary", {})
+        self.assertRegex("The Secretary", pattern)
+        self.assertRegex("That the Secretary", pattern)
+        self.assertIsNone(_code_wording("provided That the Secretary", {}))
+
+
 class CodeWordingTests(unittest.TestCase):
     """The Code's editors reword an Act's text: its own section numbers for the Act's, "this chapter" for
     "this Act", dates for "the date of enactment", curly apostrophes. A phrase quoted from the Act is matched

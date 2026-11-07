@@ -179,6 +179,10 @@ def _parse_target(match: re.Match) -> Target | None:
     elif public_law:
         target.public_law = f"{public_law.group(1)}-{public_law.group(2)}"
         target.is_note = True
+    elif re.fullmatch(r"\d+ Stat\. \d+(?:, (?:chapter|ch\.) \w+)?", target.cite):
+        # "The Act of February 5, 1948 (62 Stat. 17, chapter 45)": no Code citation here. Each instruction
+        # under it may give one, as in "in section 2 (62 Stat. 18, chapter 45; 25 U.S.C. 324)".
+        return target
     else:
         return None
     return target
@@ -298,19 +302,22 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
         return path, within, heading, text
 
 
-_SECTION_CITED = re.compile(rf"^in section (?P<section>\w+)(?P<path>(?:\(\w+\))*) {_CITE}(?:, |—|$)")
+_SECTION_CITED = re.compile(rf"^in (?:section (?P<section>\w+)|the (?P<first>first) section)(?P<path>(?:\(\w+\))*) "
+                            rf"{_CITE}(?:, |—|$)")
 
 
 def _locate_section(target: Target, text: str) -> tuple[Target, str]:
     """Handle "in section 1412(b)(2) (50 U.S.C. 98b note)," under a lead-in that names the Act without a
     section, as in "The … Act (Public Law 118–159) is amended—". Each instruction then gets its own section,
-    and its own Code citation when the Act was cited only by Public Law, so the right title is searched."""
+    and its own Code citation when the Act was cited only by Public Law or the Statutes at Large, so the right
+    title is searched. "In the first section (62 Stat. 17, chapter 45; 25 U.S.C. 323)" is section 1."""
     match = _SECTION_CITED.match(text)
     if not match or target.section or target.chapter or target.name.startswith("title "):
         return target, text
-    located = replace(target, section=match.group("section"),
+    located = replace(target, section="1" if match.group("first") else match.group("section"),
                       path=target.path + _level_for(_parts_of(match.group("path")), "section"))
-    usc = re.fullmatch(r"(\d+) U\.S\.C\. (\w+)(?:\([^)]*\))*( note)?", match.group("cite"))
+    # The Code citation may follow a Statutes at Large one: "62 Stat. 18, chapter 45; 25 U.S.C. 324".
+    usc = re.fullmatch(r"(?:[^;]*; )?(\d+) U\.S\.C\. (\w+)(?:\([^)]*\))*( note)?", match.group("cite"))
     if usc and target.title is None:
         located.title, located.usc_section = int(usc.group(1)), usc.group(2)
         located.is_note = located.is_note or bool(usc.group(3))

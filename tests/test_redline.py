@@ -688,6 +688,83 @@ class BlockTests(unittest.TestCase):
             self.apply(node, "(t) Nothing in this section", [new_node("subsection", "u", "Savings", "Nothing")])
 
 
+class FollowingTests(unittest.TestCase):
+    """'… and inserting the following:' with run-in text before new subdivisions, text added at the end, and
+    new subdivisions inserted before others: the shapes in S. 5653 §§ 2101(f)(2), 2233(a), 2252(c)(3) and
+    2301(c)(3)."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s824p"><num value="824p">§ 824p.</num>'
+            '<subsection><num value="a">(a)</num><content>The Department shall act as the lead agency.</content>'
+            '</subsection><subsection><num value="b">(b)</num><content>Except under section 388(d) of the Energy '
+            'Policy Act of 2005, the Secretary shall issue a lease on a competitive basis.</content></subsection>'
+            '<subsection><num value="c">(c)</num><content>The fee is due, as defined in section 2(f), in full.'
+            '</content></subsection><subsection><num value="e">(e)</num><content>Final.</content></subsection>'
+            '<sourceCredit>(June 10, 1920, ch. 285, pt. II, § 216.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum>{text}</paragraph>" for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>Section 216 of the Federal Power Act (16 U.S.C. 824p) "
+                              f"is amended—</text>{items}</section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        return outcome, find_doc(outcome, "16 U.S.C. § 824p").root
+
+    def test_end_punctuation_gives_way_to_run_in_text_and_new_subdivisions(self):
+        outcome, root = self.run_bill(
+            "<text>in subsection (a), by striking the period at the end and inserting the following:</text>"
+            "<quoted-block><text>, except that—</text><paragraph><enum>(1)</enum><text>the Commission shall act; "
+            "and</text></paragraph><paragraph><enum>(2)</enum><text>the Secretary shall act offshore.</text>"
+            "</paragraph><after-quoted-block>;</after-quoted-block></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        subsection = root.children[0]
+        self.assertEqual(marked(subsection.body), "The Department shall act as the lead agency[-.-][+, except that—+]")
+        self.assertEqual([c.value for c in subsection.children], ["1", "2"])
+
+    def test_run_in_text_opened_in_the_instruction_and_a_new_subdivision_after_the_one_named(self):
+        outcome, root = self.run_bill(
+            "<text>in subsection (b), by striking <quote>, the Secretary shall issue a lease</quote> and inserting "
+            "the following: “(16 U.S.C. 824p note), the Secretary—</text><quoted-block><paragraph><enum>(1)</enum>"
+            "<text>shall issue a lease</text></paragraph><after-quoted-block>; and</after-quoted-block>"
+            "</quoted-block>",
+            "<text>in subsection (b)(1) (as so designated), by striking the period at the end and inserting the "
+            "following: “; and</text><quoted-block><paragraph><enum>(2)</enum><text>may issue a permit.</text>"
+            "</paragraph><after-quoted-block>.</after-quoted-block></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (2, []))
+        subsection = root.children[1]
+        self.assertEqual(marked(subsection.body), "Except under section 388(d) of the Energy Policy Act of 2005"
+                         "[-, the Secretary shall issue a lease-][+ (16 U.S.C. 824p note), the Secretary—+]")
+        first, second = subsection.children
+        self.assertEqual(marked(first.body), "[+shall issue a lease+] on a competitive basis[-.-][+; and+]")
+        self.assertEqual((second.value, marked(second.body)), ("2", "[+may issue a permit.+]"))
+
+    def test_text_added_at_the_end_is_a_new_sentence(self):
+        outcome, root = self.run_bill("<text>in subsection (e), by adding at the end the following: <quote>The "
+                                      "Commission shall publish it.</quote>.</text>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual(marked(root.children[3].body), "Final.[+ The Commission shall publish it.+]")
+
+    def test_new_subdivisions_inserted_before_one_named(self):
+        outcome, root = self.run_bill(
+            "<text>by inserting before subsection (e) the following:</text><quoted-block><subsection>"
+            "<enum>(d)</enum><text>Reports are due.</text></subsection><after-quoted-block>;</after-quoted-block>"
+            "</quoted-block>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual([c.value for c in root.children], ["a", "b", "c", "d", "e"])
+
+    def test_a_locator_without_a_comma(self):
+        outcome, root = self.run_bill("<text>in subsection (c) by striking <quote>, as defined in section 2(f),"
+                                      "</quote>.</text>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual(marked(root.children[2].body), "The fee is due[-, as defined in section 2(f),-] in full.")
+
+    def test_run_in_text_with_an_operation_that_cant_place_it_isnt_recognized(self):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 216 of the Federal Power Act (16 U.S.C. 824p) is amended by "
+            "adding at the end the following:</text><quoted-block><text>Also—</text><subsection><enum>(f)</enum>"
+            "<text>more.</text></subsection></quoted-block></section>")
+        self.assertEqual([p.reason for p in bill.problems], ["instruction wording isn't a recognized pattern"])
+
+
 class OpeningTests(unittest.TestCase):
     def apply(self, node, end, block, n=None, unit="section", positive_law=False):
         doc = SimpleNamespace(title="Test", root=node, basis="code", order=(30, (226, ""), 0))

@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field, replace
 
 from .bill import Bill, Instruction, Target
-from .statute import INS, Act, CodeTitle, Document, Node, Segment, Text, norm
+from .statute import INS, LEVELS, Act, CodeTitle, Document, Node, Segment, Text, norm
 
 
 @dataclass
@@ -63,7 +63,8 @@ def _act_name(name: str) -> str:
     the Federal Power Act."""
     return re.sub(r"^(?:(?:Part|Title|Subtitle) \w+ of )?(?:the )?", "", name)
 
-_SUBDIVISION_ACTIONS =("delete_nodes", "replace_nodes", "redesignate", "insert_after_node", "add_at_end")
+_SUBDIVISION_ACTIONS =("delete_nodes", "replace_nodes", "redesignate", "insert_after_node", "insert_before_node",
+                       "add_at_end")
 
 
 def _ends_with_inline(node: Node, value: str) -> bool:
@@ -382,12 +383,17 @@ class Engine:
             node.children.extend(args["blocks"])
             self._check_duplicates(inst, doc, node)
             return True
-        if action == "insert_after_node":
+        if action in ("insert_after_node", "insert_before_node"):
             targets = self._children(inst, doc, node, args["values"], args["kind"])
-            position = node.children.index(targets[-1]) + 1
+            position = node.children.index(targets[-1]) + 1 if action == "insert_after_node" \
+                else node.children.index(targets[0])
             node.children[position:position] = args["blocks"]
             self._check_duplicates(inst, doc, node)
             return True
+        if action == "replace_at_end_with_block":
+            return self._replace_at_end_with_block(inst, doc, node)
+        if action == "add_text_at_end":
+            return self._add_text_at_end(inst, doc, node)
         raise _NotApplied(f"Not applied: no handler for '{action}'.", doc, node)
 
     def _children(self, inst, doc, node, values, kind) -> list[Node]:
@@ -514,6 +520,58 @@ class Engine:
         _swap(text, start, len(current), new, inst.cite)
         return True
 
+    def _replace_at_end_with_block(self, inst, doc, node) -> bool:
+        """'By striking the period at the end and inserting the following: “, except that—” (A) … (B) …'.
+        The end punctuation gives way to the run-in text, and the new subdivisions follow: under the
+        provision when it has none, after its last subdivision when they're at that level, or after the
+        provision itself when they're at its own level, as in 'in subparagraph (A), by striking the period at
+        the end and inserting “; and” (B) …'."""
+        old, lead, blocks = inst.args["old"], inst.args["lead"], inst.args["blocks"]
+        if inst.within:
+            raise _NotApplied("Not applied: an edit at the end of only part of a provision isn't supported.", doc, node)
+        live = [c for c in node.children if not c.deleted and c.kind != "continuation"]
+        if node.tail.current():
+            raise _NotApplied(f"Not applied: text follows the subdivisions of {_describe(node, doc)}, so it isn't "
+                              "clear where the new subdivisions go.", doc, node)
+        kind = blocks[0].kind
+        parent, position = node, len(node.children)
+        if kind == node.kind and node is not doc.root:
+            parent = next((p for p in _walk_nodes(doc.root) if node in p.children), None)
+            fits = parent is not None
+            position = parent.children.index(node) + 1 if fits else 0
+        elif live:
+            fits = kind == live[-1].kind
+        else:
+            fits = node.kind not in LEVELS or (kind in LEVELS and LEVELS.index(kind) > LEVELS.index(node.kind))
+        if not fits or any(b.kind != kind for b in blocks):
+            raise _NotApplied(f"Not applied: the new {blocks[0].kind} doesn't fit at the end of "
+                              f"{_describe(node, doc)}.", doc, node)
+        texts = [t for t in node.texts(headings=False) if t.current()]
+        text = texts[-1] if texts else None
+        current = text.current().rstrip() if text else ""
+        if not current.endswith(old):
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't end with “{old}”.", doc, node)
+        _swap(text, len(current) - len(old), len(current), lead, inst.cite)
+        parent.children[position:position] = blocks
+        self._check_duplicates(inst, doc, parent)
+        return True
+
+    def _add_text_at_end(self, inst, doc, node) -> bool:
+        """'By adding at the end the following: “…”' with text rather than new subdivisions: a sentence
+        added to the provision's text."""
+        if inst.within or inst.heading:
+            raise _NotApplied("Not applied: adding text at the end of only part of a provision isn't supported.",
+                              doc, node)
+        live = [c for c in node.children if not c.deleted]
+        text = node.tail if live else node.body
+        if live and not text.current():
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} ends with subdivisions, so it isn't clear where "
+                              "the new text goes.", doc, node)
+        current = text.current()
+        end = len(current.rstrip())
+        text.insert(end, f" {inst.args['new']}" if end else inst.args["new"], (inst.cite,))
+        return True
+
     def _replace_span(self, inst, doc, node) -> bool:
         """'By striking "A" and all that follows through "B"', within one block of text."""
         start, end, new = inst.args["start"], inst.args["end"], inst.args["new"]
@@ -546,10 +604,13 @@ class Engine:
         """'By striking "X" and inserting the following:' with new subdivisions. Bills use this to break
         existing text into subdivisions: the struck text is replaced by the new ones, and the text that
         followed it continues as the text of the last of them."""
-        old, blocks = inst.args["old"], inst.args["blocks"]
+        old, blocks, lead = inst.args["old"], inst.args["blocks"], inst.args.get("lead", "")
         if not old.startswith("("):
-            self._split_into(inst, doc, node, old, blocks, at_start=False)
+            self._split_into(inst, doc, node, old, blocks, at_start=False, lead=lead)
             return True
+        if lead:
+            raise _NotApplied("Not applied: the struck text starts with a designation, and the new text has run-in "
+                              "text before its subdivisions.", doc, node)
         # Struck text that begins with a designation, as in "(e)(1) In carrying", restructures that
         # provision in place, adding headings and new levels under it.
         if len(blocks) != 1:
@@ -639,9 +700,10 @@ class Engine:
         self._check_duplicates(inst, doc, node)
         return True
 
-    def _split_into(self, inst, doc, node, old, blocks, at_start) -> None:
+    def _split_into(self, inst, doc, node, old, blocks, at_start, lead="") -> None:
         """Strike old from node's introductory text and put blocks in its place as new subdivisions, moving
-        the text that followed old into the last of them. New provisions at node's own level, as in 'in
+        the text that followed old into the last of them. Run-in text the new subdivisions follow, as in
+        "the Secretary—", takes old's place. New provisions at node's own level, as in 'in
         paragraph (1), by striking "to promote" and inserting (2) to promote', follow node instead."""
         if any(c.label.before() for c in node.children if not c.deleted):
             raise _NotApplied(f"Not applied: {_describe(node, doc)} already has subdivisions, and the instruction "
@@ -661,7 +723,11 @@ class Engine:
             raise _NotApplied(f"Not applied: “{old}” {problem} in the text of {_describe(node, doc)}.", doc, node)
         match = hits[0][1]
         text.strike(match.start(), match.end(), inst.cite)
-        rest = text.cut(match.start())
+        if lead[:1] == "(" and text.current()[match.start() - 1:match.start()].isalnum():
+            lead = " " + lead  # a citation run in after a word, as in "Act of 2005 (43 U.S.C. 1337 note)"
+        if lead:
+            text.insert(match.start(), lead, (inst.cite,))
+        rest = text.cut(match.start() + len(lead))
         last = blocks[-1]
         while last.children:
             last = last.children[-1]

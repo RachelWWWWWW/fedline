@@ -243,6 +243,11 @@ _ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixt
 _ORDINAL = "|".join(_ORDINALS)
 
 
+# What ends a locator: a comma or dash, the end of the text, or, as bills sometimes omit the comma, the
+# operation itself ("in the matter preceding subparagraph (A) by striking").
+_SEP = r"(?:, |—|$| (?=by ))"
+
+
 def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool, str]:
     """Consume leading 'in subsection (a), in the heading, in the first sentence,' phrases."""
     path: list[tuple[str, str]] = []
@@ -250,29 +255,29 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
     heading = False
     text = _AS_NOTE.sub("", text)
     while True:
-        match = re.match(rf"^in the ({_ORDINAL}) sentence(?:, |—|$)", text)
+        match = re.match(rf"^in the ({_ORDINAL}) sentence{_SEP}", text)
         if match:
             within.append(("sentence", _ORDINALS[match.group(1)]))
             text = text[match.end():]
             continue
-        match = re.match(r"^in the (?:undesignated )?matter (preceding|following) (\w+) \((\w+)\)(?:, |—|$)", text)
+        match = re.match(rf"^in the (?:undesignated )?matter (preceding|following) (\w+) \((\w+)\){_SEP}", text)
         if match and match.group(2) in LEVELS:
             within.append(match.groups())
             text = text[match.end():]
             continue
-        match = re.match(r"^in the (?:\w+ )?heading of (\w+) ((?:\(\w+\))+)(?:, |—|$)", text)
+        match = re.match(rf"^in the (?:\w+ )?heading of (\w+) ((?:\(\w+\))+){_SEP}", text)
         if match:
             path += _path_from(match.group(1), match.group(2))
             heading = True
             text = text[match.end():]
             continue
-        match = re.match(r"^in the (?:\w+ )?heading(?:, |—|$)", text)
+        match = re.match(rf"^in the (?:\w+ )?heading{_SEP}", text)
         if match:
             heading = True
             text = text[match.end():]
             continue
         match = re.match(
-            rf"^in each of ({_KINDS}) ((?:\(\w+\))+(?:(?:,? and |, | through )(?:\(\w+\))+)*)(?:, |—|$)", text)
+            rf"^in each of ({_KINDS}) ((?:\(\w+\))+(?:(?:,? and |, | through )(?:\(\w+\))+)*){_SEP}", text)
         if match:
             alternatives = _each_paths(_LEVEL_WORDS[match.group(1)], match.group(2))
             if alternatives is None:
@@ -280,12 +285,12 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
             path.append(("each", alternatives))
             text = text[match.end():]
             continue
-        match = re.match(r"^in section (\w+)(?:, |—|$)", text)
+        match = re.match(rf"^in section (\w+){_SEP}", text)
         if match:
             path.append(("section", match.group(1)))
             text = text[match.end():]
             continue
-        match = re.match(r"^in (\w+) ((?:\(\w+\))+)(?:, |—|$)", text)
+        match = re.match(rf"^in (\w+) ((?:\(\w+\))+){_SEP}", text)
         if match and match.group(1) in LEVELS:
             path += _path_from(match.group(1), match.group(2))
             text = text[match.end():]
@@ -334,8 +339,18 @@ def _path_from(kind: str, values: str) -> list[tuple[str, str]]:
 _PUNCTUATION = {"period": ".", "semicolon": ";", "comma": ",", "colon": ":"}
 
 
-def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str, dict] | None:
-    """Recognize an instruction's operation. Returns None when it isn't understood."""
+def _parse_action(text: str, quotes: list[str], blocks: list[Node], lead: str = "") -> tuple[str, dict] | None:
+    """Recognize an instruction's operation. Returns None when it isn't understood.
+
+    lead is run-in text that the new subdivisions follow, as in 'inserting the following: “, except
+    that—” (A) …'. Only operations that place it accept it."""
+    parsed = _parse_operation(text, quotes, blocks, lead)
+    if parsed and lead and "lead" not in parsed[1]:
+        return None
+    return parsed
+
+
+def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str) -> tuple[str, dict] | None:
     text = re.sub(r"[;.,]?(?: and| or)?$", "", text).strip()
     q = lambda m, name: quotes[int(m.group(name))]
 
@@ -354,7 +369,18 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
     if match and match.group("b") and not blocks:
         return "replace", {"old": q(match, "a"), "new": q(match, "b"), "every": False, "except": None}
     if match and blocks and not match.group("b"):
-        return "replace_with_block", {"old": q(match, "a"), "blocks": blocks}
+        return "replace_with_block", {"old": q(match, "a"), "blocks": blocks, "lead": lead}
+
+    match = re.fullmatch(
+        rf"by striking (?:⟦(?P<a>\d+)⟧|the (?P<pa>{punct})) at the end and inserting the following:?", text)
+    if match and blocks:
+        return "replace_at_end_with_block", {
+            "old": q(match, "a") if match.group("a") else _PUNCTUATION[match.group("pa")],
+            "blocks": blocks, "lead": lead}
+
+    match = re.fullmatch(r"by adding at the end the following:? ⟦(?P<b>\d+)⟧", text)
+    if match and not blocks:
+        return "add_text_at_end", {"new": q(match, "b")}
 
     match = re.fullmatch(
         rf"by striking (?:⟦(?P<a>\d+)⟧|the (?P<pa>{punct}))(?: after the (?P<after>{punct}))? at the end"
@@ -453,12 +479,12 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
     if match and blocks:
         return "add_at_end", {"blocks": blocks}
 
-    match = re.fullmatch(rf"by inserting after ({kinds}) (.+?) the following:?", text)
+    match = re.fullmatch(rf"by inserting (after|before) ({kinds}) (.+?) the following:?", text)
     if match and blocks:
-        kind = _LEVEL_WORDS[match.group(1)]
-        values = _designators(match.group(2), kind)
+        kind = _LEVEL_WORDS[match.group(2)]
+        values = _designators(match.group(3), kind)
         if values:
-            return "insert_after_node", {"kind": kind, "values": values, "blocks": blocks}
+            return f"insert_{match.group(1)}_node", {"kind": kind, "values": values, "blocks": blocks}
 
     return None
 
@@ -490,6 +516,22 @@ def _block_nodes(el: ET.Element, source: str) -> list[Node]:
     for block in el.findall("quoted-block"):
         blocks.extend(_new_node(child, source) for child in block if child.tag in LEVELS)
     return blocks
+
+
+def _lead_text(el: ET.Element, rest: str, blocks: list[Node]) -> tuple[str, str]:
+    """Run-in text that new subdivisions follow. Bills give it either as a quotation the instruction opens
+    and the quoted block closes, as in 'inserting the following: “; and' then (B), or as text at the top of
+    the quoted block. Returns the instruction without it, and the text."""
+    if not blocks:
+        return rest, ""
+    match = re.search(r"( the following:?) “([^”⟦⟧]*)$", rest)
+    if match:
+        return rest[:match.end(1)], norm(match.group(2))
+    block = el.find("quoted-block")
+    first = next(iter(block), None) if block is not None else None
+    if first is not None and first.tag == "text":
+        return rest, norm(_quoted_flat(first))
+    return rest, ""
 
 
 def _is_lead(text: str) -> re.Match | None:
@@ -593,7 +635,9 @@ class _Parser:
     def leaf(self, el, rest, quotes, target, path, within, cite, heading, raw=None) -> None:
         cite_text = _cite(cite)
         located, more_within, more_heading, rest = _parse_locators(rest.strip())
-        parsed = _parse_action(rest, quotes, _block_nodes(el, cite_text))
+        blocks = _block_nodes(el, cite_text)
+        rest, lead = _lead_text(el, rest, blocks)
+        parsed = _parse_action(rest, quotes, blocks, lead)
         full = raw or rest
         for i, quote in enumerate(quotes):
             full = full.replace(f"⟦{i}⟧", f"“{quote}”")

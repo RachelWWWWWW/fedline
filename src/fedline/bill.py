@@ -410,6 +410,17 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
         if values:
             return "delete_nodes", {"kind": kind, "values": values}
 
+    # Formatting only: "by indenting clauses (i) through (v) appropriately", "by moving the margins of
+    # subparagraphs (A) and (B) 2 ems to the right".
+    match = re.fullmatch(
+        rf"by (?:indenting ({kinds}) (.+?)(?: appropriately)?|moving the margins? of ({kinds}) (.+?) "
+        r"\d+ ems? to the (?:right|left))", text)
+    if match:
+        kind = _LEVEL_WORDS[match.group(1) or match.group(3)]
+        values = _designators(match.group(2) or match.group(4), kind)
+        if values:
+            return "indent", {"kind": kind, "values": values}
+
     match = re.fullmatch(rf"by redesignating ({kinds}) (.+?) as ({kinds}) (.+?)(?:, respectively)?", text)
     if match:
         kind = _LEVEL_WORDS[match.group(1)]

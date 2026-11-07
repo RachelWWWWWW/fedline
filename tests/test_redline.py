@@ -281,6 +281,21 @@ class EachOfTests(unittest.TestCase):
         self.assertIsNone(texts)  # nothing changed, so the section isn't in the redline
         self.assertIn("none were changed", outcome.flags[-1].message)
 
+    def test_indenting_is_applied_without_marks_and_flagged_for_review(self):
+        for wording in ("by indenting paragraphs (1) through (3) appropriately.",
+                        "by moving the margins of paragraphs (1) through (3) 2 ems to the right."):
+            outcome, texts = self.run_bill(wording)
+            self.assertEqual((outcome.applied, outcome.failed), (1, 0))
+            self.assertIsNone(texts)  # no words changed
+            self.assertEqual([f.blocking for f in outcome.flags], [False])
+            self.assertIn("Indentation only: the instruction moves paragraphs (1) through (3)",
+                          outcome.flags[0].message)
+
+    def test_indenting_a_missing_subdivision_isnt_applied(self):
+        outcome, _ = self.run_bill("by indenting paragraphs (1) through (4) appropriately.")
+        self.assertEqual((outcome.applied, outcome.failed), (0, 1))
+        self.assertIn("paragraph (4) wasn't found", outcome.flags[0].message)
+
     def test_near_misses_are_checked_only_where_the_replacement_reached(self):
         outcome, texts = self.run_bill("in each of paragraphs (1) and (2), by striking <quote>Secretary</quote> "
                                        "each place it appears and inserting <quote>Commission</quote>.")

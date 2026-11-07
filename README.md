@@ -85,7 +85,8 @@ If the run stops with an error:
 
 - Instructions are parsed by pattern matching. Wording the parser doesn't recognize is flagged and listed, not applied. The LLM step for harder wording isn't built yet. Wording not yet recognized includes:
   - "in the first proviso"
-  - indenting, and moving text. Nothing is shown in the "moved" format yet.
+  - moving text. Nothing is shown in the "moved" format yet.
+- An instruction that only changes indentation, such as "by indenting clauses (i) through (v) appropriately", is applied without marks, because the redline indents each provision by its level. It's flagged to review.
 - When the Code's editors changed the Act's wording, for example printing "subchapter II of this chapter" for the Act's "title II of this Act", the bill's quoted text isn't found in the Code. The instruction is flagged, not applied.
 - A law cited only by the Statutes at Large, with no Code citation, isn't found. Neither is a chapter's table of sections.
 - The Code's editorial footnotes are left out of the statutory text. Bracketed editorial notes printed in the text, such as "[Amended this section.]", are kept.

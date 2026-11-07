@@ -346,6 +346,17 @@ class Engine:
             return True
         if action == "redesignate":
             return self._redesignate(inst, doc, node)
+        if action == "indent":
+            # The words don't change, and the redline indents each subdivision by its level, so there's
+            # nothing to mark. The subdivisions are still checked, so a wrong reference isn't counted.
+            values = args["values"]
+            self._children(inst, doc, node, values, args["kind"])
+            names = f"{args['kind']}s ({values[0]}) through ({values[-1]})" if len(values) > 1 \
+                else f"{args['kind']} ({values[0]})"
+            self._flag(inst.cite, f"Indentation only: the instruction moves {names} of "
+                                  f"{_describe(node, doc)} without changing their words. The redline sets "
+                                  "indentation by level, so no change is shown.", False, doc, node)
+            return True
         if action == "replace_nodes":
             targets = self._children(inst, doc, node, args["values"], args["kind"])
             position = node.children.index(targets[-1]) + 1

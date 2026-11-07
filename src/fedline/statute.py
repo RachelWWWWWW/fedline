@@ -336,14 +336,14 @@ class CodeTitle:
 
     def act_of(self, number: str) -> Act | None:
         """Map an Act's section numbers to Code sections using each section's source credit."""
-        origin = self._origin(number)
+        origin = self.origin(number)
         if origin is None:
             return None
         law, _ = origin
         act = Act(law=law, title=self.number)
         ambiguous = set()
         for candidate in self.sections:
-            found = self._origin(candidate)
+            found = self.origin(candidate)
             if found and found[0] == law:
                 doc = self.document(candidate)
                 if doc is None:
@@ -356,7 +356,7 @@ class CodeTitle:
             del act.sections[section]
         return act
 
-    def _origin(self, number: str) -> tuple[str, str] | None:
+    def origin(self, number: str) -> tuple[str, str] | None:
         """The law a Code section was enacted by, and its section number in that law."""
         el = self.sections.get(number)
         credit = el.find(f"{{{self.ns}}}sourceCredit") if el is not None else None

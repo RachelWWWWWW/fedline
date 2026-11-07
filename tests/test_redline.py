@@ -12,7 +12,7 @@ from fedline.bill import _designators, parse_bill
 from fedline.cli import redline
 from fedline.docx_writer import write_docx
 from fedline.bill import Instruction, Target
-from fedline.engine import Engine, _NotApplied, _sentences, _word_matches
+from fedline.engine import Engine, _NotApplied, _sentences, _word_matches, apply_bill
 from fedline.sources import SourceError, parse_bill_url
 from fedline.statute import CodeTitle, DEL, INS, Node, Text, _strip_ws, credit_origin
 
@@ -147,6 +147,34 @@ class UslmShapeTests(unittest.TestCase):
         self.assertEqual([(c.kind, c.body.current()) for c in root.children if c.kind == "continuation"],
                          [("continuation", "It also includes land that—"), ("continuation", "[Amended this section.]")])
         self.assertEqual(root.tail.current(), "Provided, That this applies.")
+
+
+class ActNameTests(unittest.TestCase):
+    """A bill can name one Act in different ways, like "the Federal Power Act" and "Part II of the Federal
+    Power Act". Every name must reach the same sections."""
+
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s824"><num value="824">§ 824.</num><content>The rate is fair.'
+            '</content><sourceCredit>(June 10, 1920, ch. 285, pt. II, § 201.)</sourceCredit></section>'
+            '<section identifier="/us/usc/t16/s824a"><num value="824a">§ 824a.</num><content>The Commission may act.'
+            '</content><sourceCredit>(June 10, 1920, ch. 285, pt. II, § 202.)</sourceCredit></section>'
+            '</main></uscDoc>').encode()
+
+    def test_edits_through_different_names_reach_the_same_sections(self):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 201 of the Federal Power Act (16 U.S.C. 824) is amended by "
+            "striking <quote>fair</quote> and inserting <quote>just</quote>.</text></section>"
+            "<section><enum>3.</enum><text>Part II of the Federal Power Act (16 U.S.C. 824 et seq.) is amended, "
+            "in section 201, by striking <quote>rate</quote> and inserting <quote>charge</quote>.</text></section>"
+            "<section><enum>4.</enum><text>Part II of the Federal Power Act (16 U.S.C. 824 et seq.) is amended by "
+            "adding at the end the following:</text><quoted-block><section><enum>203.</enum><header>New</header>"
+            "<text>Text.</text></section></quoted-block></section>")
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        self.assertEqual(outcome.applied, 3)
+        self.assertEqual(marked(find_doc(outcome, "16 U.S.C. § 824").root.body),
+                         "The [-rate-][+charge+] is [-fair-][+just+].")
+        new = find_doc(outcome, "New § 203 of the Federal Power Act (no Code section number yet)")
+        self.assertGreater(new.order, find_doc(outcome, "16 U.S.C. § 824").order)
 
 
 class CreditTests(unittest.TestCase):

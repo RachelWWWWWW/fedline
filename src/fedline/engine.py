@@ -49,7 +49,9 @@ def _word_matches(phrase: str, text: str, ignore_case: bool = False) -> list[re.
     return list(re.finditer(rf"{before}{re.escape(phrase)}{after}", text, flags))
 
 
-_SUBDIVISION_ACTIONS = ("delete_nodes", "replace_nodes", "redesignate", "insert_after_node", "add_at_end")
+_UNIT_ABBREVIATIONS = {"part": r"pt\.", "title": "title", "subtitle": "subtitle"}
+
+_SUBDIVISION_ACTIONS =("delete_nodes", "replace_nodes", "redesignate", "insert_after_node", "add_at_end")
 
 
 def _ends_with_inline(node: Node, value: str) -> bool:
@@ -110,6 +112,7 @@ class Engine:
         self.global_phrases: list[tuple[str, Document, str]] = []
         self.duplicates: set[tuple[int, tuple[str, str]]] = set()
         self.inline: set[tuple[int, str]] = set()
+        self.units: dict[str, tuple[str, str] | None] = {}  # the part or title each new section was added to
 
     def run(self) -> Outcome:
         for problem in self.bill.problems:
@@ -145,14 +148,17 @@ class Engine:
         title = self.titles.get(target.title)
         if title is None or target.usc_section is None:
             return None
-        key = (target.title, target.name)
+        # Keyed by the enacting law, not the bill's name for it, so "the Federal Power Act" and "Part II of
+        # the Federal Power Act" share one set of sections and see each other's edits.
+        origin = title.origin(target.usc_section)
+        if origin is None:
+            return None
+        key = (target.title, origin[0])
         if key not in self.acts:
             act = title.act_of(target.usc_section)
-            if act is None:
-                return None
+            # Use the documents already being edited, if another instruction reached them first.
+            act.sections = {n: self.docs.setdefault(doc.key, doc) for n, doc in act.sections.items()}
             self.acts[key] = act
-            for doc in act.sections.values():
-                self.docs.setdefault(doc.key, doc)
         return self.acts[key]
 
     def _note(self, target: Target) -> Document | None:
@@ -217,7 +223,10 @@ class Engine:
         if inst.action == "redesignate" and inst.args["kind"] == "section" and section is None:
             return self._redesignate_sections(inst, act)
         if inst.action == "insert_after_node" and inst.args["kind"] == "section" and section is None:
-            return self._insert_section(inst, act)
+            return self._insert_section(inst, act, act.sections.get(inst.args["values"][-1]), None)
+        if (inst.action == "add_at_end" and section is None and not path
+                and all(b.kind == "section" for b in inst.args["blocks"])):
+            return self._add_sections_at_end(inst, act)
         if section is None:
             if inst.action == "replace" and inst.args["every"]:
                 return self._global_in_act(inst, act)
@@ -600,15 +609,36 @@ class Engine:
         self._flag(inst.cite, message, False)
         return True
 
-    def _insert_section(self, inst, act: Act) -> bool:
-        after = inst.args["values"][-1]
-        previous = act.sections.get(after)
+    def _add_sections_at_end(self, inst, act: Act) -> bool:
+        """'Part II of the Federal Power Act is amended by adding at the end the following: SEC. 225. …'"""
+        match = re.match(r"(Part|Title|Subtitle) (\w+) of ", inst.target.name)
+        unit = (match.group(1).lower(), match.group(2)) if match else None
+        docs = [d for d in act.sections.values() if unit is None or self._unit_of(d, unit[0]) == unit[1]]
+        if not docs:
+            return self._not_redlined(inst, f"no section of {inst.target.name} was found in the Code")
+        return self._insert_section(inst, act, max(docs, key=lambda d: d.order), unit)
+
+    def _unit_of(self, doc: Document, word: str) -> str | None:
+        """Which part, title or subtitle of its Act a section is in, from its source credit."""
+        if doc.key in self.units:
+            found = self.units[doc.key]
+            return found[1] if found and found[0] == word else None
+        enactment = doc.credit.split("§")[0]
+        match = re.search(rf"\b{_UNIT_ABBREVIATIONS[word]} (\w+),", enactment)
+        return match.group(1) if match else None
+
+    def _insert_section(self, inst, act: Act, previous: Document | None, unit) -> bool:
+        # A Public Law number identifies the Act exactly; older laws are better known by name.
+        name = act.law if act.law.startswith("Pub. L.") else "the " + re.sub(
+            r"^(?:(?:Part|Title|Subtitle) \w+ of )?(?:the )?", "", inst.target.name)
         for index, block in enumerate(inst.args["blocks"]):
             number = block.value
-            order = (previous.order[0], previous.order[1], 2 + index) if previous else (act.title, (10 ** 9, ""), index)
+            # After the previous section and its notes, and after any new sections already placed after it.
+            order = ((previous.order[0], previous.order[1], max(previous.order[2], 1) + 1 + index) if previous
+                     else (act.title, (10 ** 9, ""), index))
             doc = Document(
                 key=f"new:{act.law}:{number}",
-                title=f"New § {number} of {act.law} (no Code section number yet)",
+                title=f"New § {number} of {name} (no Code section number yet)",
                 root=block,
                 basis="new",
                 order=order,
@@ -617,6 +647,7 @@ class Engine:
                 self._flag(inst.cite, f"Act § {number} already exists when this new section is added.", True, doc)
             act.sections[number] = doc
             self.docs[doc.key] = doc
+            self.units[doc.key] = unit
         return True
 
     def _check_duplicates(self, inst, doc, node) -> None:

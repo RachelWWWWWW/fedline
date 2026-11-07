@@ -1112,12 +1112,18 @@ class Engine:
             return self._not_redlined(inst, f"{target.name} wasn't found in the Code")
         last = self._direct(Target(title=target.title, usc_section=sections[-1]))
         for index, block in enumerate(inst.args["blocks"]):
-            number = block.value
-            block.label = Text(f"§ {number}.", INS, (inst.cite,))  # a Code section, not an Act's "Sec."
-            doc = Document(key=f"new:{target.title}usc{number}", title=f"New {target.title} U.S.C. § {number}",
+            asked = block.value
+            number = _next_free(asked, lambda n: title.document(n) is not None or f"new:{target.title}usc{n}" in self.docs)
+            block.value = number or asked
+            block.label = Text(f"§ {block.value}.", INS, (inst.cite,))  # a Code section, not an Act's "Sec."
+            doc = Document(key=f"new:{target.title}usc{block.value}",
+                           title=f"New {target.title} U.S.C. § {block.value}",
                            root=block, basis="new", order=(last.order[0], last.order[1], 2 + index))
-            if title.document(number) is not None or doc.key in self.docs:
-                self._flag(inst.cite, f"{target.title} U.S.C. § {number} already exists.", True, doc)
+            if number is None:
+                self._flag(inst.cite, f"{target.title} U.S.C. § {asked} already exists.", True, doc)
+            elif number != asked:
+                self._flag(inst.cite, f"{target.title} U.S.C. § {asked} already exists, so the new section is added "
+                                      f"as § {number}, the next number not in use. Check the numbering.", False, doc)
             self.docs[doc.key] = doc
         return True
 
@@ -1142,6 +1148,11 @@ class Engine:
         # A Public Law number identifies the Act exactly; older laws are better known by name.
         name = act.law if act.law.startswith("Pub. L.") else "the " + _act_name(inst.target.name)
         for index, block in enumerate(inst.args["blocks"]):
+            asked = block.value
+            number = _next_free(asked, lambda n: n in act.sections)
+            if number is not None and number != asked:
+                block.value = number
+                block.label = Text(f"Sec. {number}.", INS, (inst.cite,))
             number = block.value
             # After the previous section and its notes, and after any new sections already placed after it.
             order = ((previous.order[0], previous.order[1], max(previous.order[2], 1) + 1 + index) if previous
@@ -1155,6 +1166,12 @@ class Engine:
             )
             if number in act.sections:
                 self._flag(inst.cite, f"Act § {number} already exists when this new section is added.", True, doc)
+            elif number != asked:
+                existing = act.sections[asked]
+                where = f" ({existing.title})" if existing.basis == "code" else ""
+                self._flag(inst.cite, f"Act § {asked} already exists{where}, so the new section is added as "
+                                      f"§ {number}, the next number not in use. Check the numbering, and any "
+                                      f"references to the new section as § {asked}.", False, doc)
             act.sections[number] = doc
             self.docs[doc.key] = doc
             self.units[doc.key] = unit
@@ -1243,6 +1260,19 @@ def _container_for(block: Node, existing: list[Node]) -> Node | None:
             found = node
         node = node.children[-1]
     return found
+
+
+def _next_free(number: str, taken) -> str | None:
+    """number, or the next higher whole number not taken when it is. None when it's taken and isn't a plain
+    number, as with "216A", whose next number isn't clear."""
+    if not taken(number):
+        return number
+    if not number.isdigit():
+        return None
+    value = int(number) + 1
+    while taken(str(value)):
+        value += 1
+    return str(value)
 
 
 def _order_keys(values: list[str]) -> list[int] | None:

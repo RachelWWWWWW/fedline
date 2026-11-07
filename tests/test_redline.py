@@ -13,7 +13,7 @@ from fedline.bill import _designators, parse_bill
 from fedline.cli import redline
 from fedline.docx_writer import write_docx
 from fedline.bill import Instruction, Target
-from fedline.engine import Engine, _NotApplied, _code_wording, _sentences, _word_matches, apply_bill
+from fedline.engine import Engine, _NotApplied, _code_wording, _next_free, _sentences, _word_matches, apply_bill
 from fedline.sources import SourceError, parse_bill_url
 from fedline.verify import verify
 from fedline.statute import CodeTitle, DEL, INS, MOVED, Node, Text, _strip_ws, credit_origin
@@ -545,6 +545,41 @@ class WholeSectionTests(unittest.TestCase):
         new = find_doc(outcome, "New 42 U.S.C. § 4348")
         self.assertEqual(new.root.label.current(), "§ 4348.")
         self.assertGreater(new.order, CodeTitle(self.CODE).document("4347").order)
+
+    def test_a_new_section_whose_number_is_taken_gets_the_next_free_one(self):
+        # As in S. 5653 § 2234, which adds a § 37 to the Federal Power Act when it already has one. Here § 209
+        # exists, so the new 209 becomes 210, and the new 210 after it becomes 211.
+        outcome = self.run_bill(
+            "<section><enum>2.</enum><text>Title II of the National Environmental Policy Act of 1969 (42 U.S.C. 4346 "
+            "et seq.) is amended by adding at the end the following:</text><quoted-block><section><enum>209.</enum>"
+            "<header>First</header>"
+            "<text>One.</text></section><section><enum>210.</enum><header>Second</header><text>Two.</text>"
+            "</section></quoted-block></section>")
+        self.assertEqual(outcome.applied, 1)
+        first = find_doc(outcome, "New § 210 of Pub. L. 91-190 (no Code section number yet)")
+        second = find_doc(outcome, "New § 211 of Pub. L. 91-190 (no Code section number yet)")
+        self.assertEqual((marked(first.root.label), marked(first.root.heading)), ("[+Sec. 210.+]", "[+First+]"))
+        self.assertEqual(marked(second.root.label), "[+Sec. 211.+]")
+        self.assertEqual([f.blocking for f in outcome.flags], [False, False])
+        self.assertEqual(outcome.flags[0].message,
+                         "Act § 209 already exists (42 U.S.C. § 4347), so the new section is added as § 210, the next "
+                         "number not in use. Check the numbering, and any references to the new section as § 209.")
+        self.assertIn("Act § 210 already exists", outcome.flags[1].message)
+
+    def test_a_new_code_section_whose_number_is_taken_gets_the_next_free_one(self):
+        outcome = self.run_bill(
+            "<section><enum>2.</enum><text>Chapter 55 of title 42, United States Code, is amended by adding at the "
+            "end the following:</text><quoted-block><section><enum>4347.</enum><header>New</header><text>Text."
+            "</text></section></quoted-block></section>")
+        new = find_doc(outcome, "New 42 U.S.C. § 4348")
+        self.assertEqual(new.root.label.current(), "§ 4348.")
+        self.assertEqual([f.blocking for f in outcome.flags], [False])
+        self.assertIn("42 U.S.C. § 4347 already exists, so the new section is added as § 4348", outcome.flags[0].message)
+
+    def test_a_taken_number_with_no_clear_next_one_stays_flagged(self):
+        self.assertIsNone(_next_free("216A", lambda n: n == "216A"))
+        self.assertEqual(_next_free("37", lambda n: n in ("37", "38")), "39")
+        self.assertEqual(_next_free("37", lambda n: False), "37")
 
 
 class EachOfTests(unittest.TestCase):

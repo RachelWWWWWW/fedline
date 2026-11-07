@@ -319,6 +319,15 @@ class CodeTitle:
             if match:
                 self.sections.setdefault(match.group(1), el)
 
+    def chapter_sections(self, chapter: str) -> list[str]:
+        """The numbers of a chapter's sections, in order."""
+        for el in self.root.iter(f"{{{self.ns}}}chapter"):
+            num = el.find(f"{{{self.ns}}}num")
+            if num is not None and num.get("value") == chapter:
+                return [n for s in el.iter(f"{{{self.ns}}}section")
+                        for n in re.findall(r"^/us/usc/t\d+[a-zA-Z]?/s([^/]+)$", s.get("identifier") or "")]
+        return []
+
     def document(self, number: str) -> Document | None:
         el = self.sections.get(number)
         if el is None:

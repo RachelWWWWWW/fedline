@@ -10,15 +10,33 @@ from .statute import LEVELS, Node, Text, INS, norm
 
 _DIVISIONS = ("division", "title", "subtitle", "part", "subpart", "chapter", "subchapter")
 _PARTS = ("subsection", "paragraph", "subparagraph", "clause", "subclause", "item", "subitem")
+# "Paragraph (4) of section 3101 of", "Section 216(b) of": where in the law the lead-in points.
+_WHERE = (r"(?:(?P<small>Subsection|Paragraph|Subparagraph|Clause|Subclause) (?P<small_path>(?:\(\w+\))+) of )?"
+          r"(?:[Ss]ection (?P<section>\w+)(?P<path>(?:\(\w+\))*) of )?")
+# A citation in parentheses, which may itself contain parentheses, as in "(42 U.S.C. 4332(2)(C))". A
+# parenthetical starting "as amended" or "as added" isn't a citation.
+_CITE = r"\((?!as )(?P<cite>(?:[^()]|\([^()]*\))+)\)"
+_AS_AMENDED = r"(?: \(as (?:amended|added|redesignated)(?:[^()]|\([^()]*\))*\)|, as amended by [^,]+,)?"
 _LEAD = re.compile(
-    r"^(?:Section (?P<section>\w+)(?P<path>(?:\(\w+\))*) of )?(?:the |The )?(?P<name>.+?) "
-    r"\((?P<cite>.+)\)(?:, as amended by [^,]+,)? is (?:further )?amended"
-    r"(?:, as amended by [^,]+,)?(?P<rest>.*)$"
+    rf"^{_WHERE}(?:the |The )?(?P<name>.+?) {_CITE}{_AS_AMENDED},? is (?:further )?amended{_AS_AMENDED}"
+    r"(?P<rest>.*)$"
 )
 _LEAD_CODE = re.compile(
     r"^Section (?P<section>\w+)(?P<path>(?:\(\w+\))*) of title (?P<title>\d+), United States Code"
     r"(?:, as amended by [^,]+)?, is (?:further )?amended(?P<rest>.*)$"
 )
+_LEAD_CHAPTER = re.compile(
+    r"^Chapter (?P<chapter>\w+) of title (?P<title>\d+), United States Code"
+    r"(?:, as amended by [^,]+)?, is (?:further )?amended(?P<rest>.*)$"
+)
+# An Act named without a citation, as in "The Federal Power Act is amended by inserting after section 216
+# (16 U.S.C. 824p) the following:". The citation, if any, comes later in the instruction.
+_LEAD_NAMED = re.compile(
+    rf"^{_WHERE}(?:the |The )?"
+    r"(?P<name>(?:(?:Title|Part|Subtitle) \w+ of (?:the )?)?[A-Z][^()]*? Act(?: of \d{4})?)"
+    rf"{_AS_AMENDED},? is (?:further )?amended(?P<rest>.*)$"
+)
+_USC_CITE = re.compile(r" \((\d+ U\.S\.C\. (?:[^()]|\([^()]*\))*)\)")
 
 
 @dataclass
@@ -46,6 +64,7 @@ class Target:
     usc_section: str | None = None
     is_note: bool = False
     public_law: str | None = None
+    chapter: str | None = None
 
 
 @dataclass
@@ -126,6 +145,17 @@ def _level_for(values: list[str], start: str) -> list[tuple[str, str]]:
 def _parse_target(match: re.Match) -> Target | None:
     groups = match.groupdict()
     target = Target(section=groups.get("section"), path=_level_for(_parts_of(groups.get("path") or ""), "section"))
+    if groups.get("small"):
+        if not target.section:
+            return None
+        small = groups["small"].lower()
+        target.path += _path_from(small, groups["small_path"])
+    if groups.get("chapter"):
+        target.title = int(groups["title"])
+        target.chapter = groups["chapter"]
+        target.name = f"chapter {groups['chapter']} of title {groups['title']}, United States Code"
+        target.cite = target.name
+        return target
     if groups.get("title"):
         target.title = int(groups["title"])
         target.usc_section = groups["section"]
@@ -133,6 +163,8 @@ def _parse_target(match: re.Match) -> Target | None:
         target.cite = target.name
         return target
     target.name = norm(groups["name"])
+    if "cite" not in groups:
+        return target  # named only; the caller looks for a citation later in the instruction
     target.cite = groups["cite"]
     usc = re.search(r"(\d+) U\.S\.C\. (\w+)(?:\([^)]*\))*( note| et seq\.)?", target.cite)
     public_law = re.search(r"Public Law (\d+)[–-](\d+)", target.cite)
@@ -149,7 +181,7 @@ def _parse_target(match: re.Match) -> Target | None:
 
 
 _LEVEL_WORDS = {f"{word}s": word for word in LEVELS} | {word: word for word in LEVELS}
-_AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|designated|added|amended)[^)]*\)")
+_AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|designated|added|amended)(?:[^()]|\([^()]*\))*\)")
 
 
 def _roman(n: int) -> str:
@@ -396,7 +428,20 @@ def _block_nodes(el: ET.Element, source: str) -> list[Node]:
 
 
 def _is_lead(text: str) -> re.Match | None:
-    return _LEAD_CODE.match(text) or _LEAD.match(text)
+    return _LEAD_CODE.match(text) or _LEAD_CHAPTER.match(text) or _LEAD.match(text) or _LEAD_NAMED.match(text)
+
+
+def _cite_from(target: Target, rest: str) -> str:
+    """For an Act named without a citation, take the first Code citation in the instruction, as in
+    "by inserting after section 2 (42 U.S.C. 4321)", and drop the citations so they aren't read as
+    designations."""
+    if target.cite or target.title:
+        return rest
+    usc = _USC_CITE.search(rest)
+    if usc:
+        found = re.match(r"(\d+) U\.S\.C\. (\w+)", usc.group(1))
+        target.cite, target.title, target.usc_section = usc.group(1), int(found.group(1)), found.group(2)
+    return _USC_CITE.sub("", rest)
 
 
 def _has_amendment(el: ET.Element) -> bool:
@@ -456,7 +501,7 @@ class _Parser:
             self.bill.problems.append(ParseProblem(_cite(cite), text, "couldn't resolve the citation for the law being amended"))
             return
         # "is amended—", "is amended, in subsection (a)—" or "is amended, in subsection (a), by …"
-        rest = match.group("rest").strip().removeprefix(",").strip()
+        rest = _cite_from(target, match.group("rest").strip().removeprefix(",").strip())
         located, within, _, remainder = _parse_locators(rest)
         children = [c for c in el if c.tag in _PARTS]
         if remainder in ("", "—") and children:

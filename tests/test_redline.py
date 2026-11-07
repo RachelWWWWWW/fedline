@@ -177,6 +177,70 @@ class ActNameTests(unittest.TestCase):
         self.assertGreater(new.order, find_doc(outcome, "16 U.S.C. § 824").order)
 
 
+class LeadInTests(unittest.TestCase):
+    def target(self, lead):
+        bill = parse_sections(f"<section><enum>2.</enum><text>{lead} by striking <quote>a</quote> and inserting "
+                              "<quote>b</quote>.</text></section>")
+        self.assertEqual(bill.problems, [])
+        return bill.instructions[0].target
+
+    def test_citation_attached_to_a_section(self):
+        bill = parse_sections("<section><enum>2.</enum><text>The Federal Power Act is amended by inserting after "
+                              "section 216 (16 U.S.C. 824p) the following:</text><quoted-block><section><enum>216A."
+                              "</enum><header>New</header><text>Text.</text></section></quoted-block></section>")
+        inst = bill.instructions[0]
+        self.assertEqual((inst.target.name, inst.target.title, inst.target.usc_section), ("Federal Power Act", 16, "824p"))
+        self.assertEqual((inst.action, inst.args["values"]), ("insert_after_node", ["216"]))
+
+    def test_smaller_unit_before_the_section(self):
+        target = self.target("Paragraph (4) of section 3101 of the Energy Act of 2020 (43 U.S.C. 3001) is amended")
+        self.assertEqual((target.section, target.path, target.usc_section), ("3101", [("paragraph", "4")], "3001"))
+
+    def test_as_amended_notes_with_parentheses(self):
+        target = self.target("Section 4 of the Geothermal Steam Act of 1970 (30 U.S.C. 1003) (as amended by section "
+                             "2223(b)) is amended")
+        self.assertEqual((target.name, target.cite), ("Geothermal Steam Act of 1970", "30 U.S.C. 1003"))
+        target = self.target("Title I of the National Environmental Policy Act of 1969 (as amended by section "
+                             "1102(b)(1)) is amended, in section 110 (42 U.S.C. 4336d),")
+        self.assertEqual((target.name, target.usc_section),
+                         ("Title I of the National Environmental Policy Act of 1969", "4336d"))
+
+    def test_code_chapter(self):
+        target = self.target("Chapter 3027 of title 54, United States Code, is amended")
+        self.assertEqual((target.title, target.chapter), (54, "3027"))
+
+
+class WholeSectionTests(unittest.TestCase):
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>42</docNumber></meta><main>'
+            '<chapter><num value="55">CHAPTER 55</num>'
+            '<section identifier="/us/usc/t42/s4346"><num value="4346">§ 4346.</num><content>Old 208.</content>'
+            '<sourceCredit>(Pub. L. 91–190, title II, § 208.)</sourceCredit></section>'
+            '<section identifier="/us/usc/t42/s4347"><num value="4347">§ 4347.</num><content>Old 209.</content>'
+            '<sourceCredit>(Pub. L. 91–190, title II, § 209.)</sourceCredit></section></chapter></main></uscDoc>').encode()
+
+    def run_bill(self, sections_xml):
+        return apply_bill(parse_sections(sections_xml), {42: CodeTitle(self.CODE)})
+
+    def test_striking_and_replacing_a_whole_section(self):
+        outcome = self.run_bill(
+            "<section><enum>2.</enum><text>Title II of the National Environmental Policy Act of 1969 is amended by "
+            "striking section 209 (42 U.S.C. 4347) and inserting the following:</text><quoted-block><section>"
+            "<enum>209.</enum><header>eNEPA</header><text>New 209.</text></section></quoted-block></section>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual(marked(find_doc(outcome, "42 U.S.C. § 4347").root.body), "[-Old 209.-]")
+        titles = [d.title for d in outcome.documents]
+        self.assertEqual(titles, ["42 U.S.C. § 4347", "New § 209 of Pub. L. 91-190 (no Code section number yet)"])
+
+    def test_adding_a_section_to_a_code_chapter(self):
+        outcome = self.run_bill(
+            "<section><enum>2.</enum><text>Chapter 55 of title 42, United States Code, is amended by adding at the "
+            "end the following:</text><quoted-block><section><enum>4348.</enum><header>New</header><text>Text."
+            "</text></section></quoted-block></section>")
+        new = find_doc(outcome, "New 42 U.S.C. § 4348")
+        self.assertEqual(new.root.label.current(), "§ 4348.")
+        self.assertGreater(new.order, CodeTitle(self.CODE).document("4347").order)
+
+
 class CreditTests(unittest.TestCase):
     def test_public_law(self):
         self.assertEqual(credit_origin("(Pub. L. 104–104, § 3, Feb. 8, 1996, 110 Stat. 56.)"),

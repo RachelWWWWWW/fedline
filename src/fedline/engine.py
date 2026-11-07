@@ -929,7 +929,9 @@ class Engine:
             child.renumber(value, inst.cite)
             # "Subsections (a) through (g) as paragraphs (8), (4), …" makes them paragraphs, which also sets
             # their indentation.
-            child.kind = new_kind
+            if new_kind != child.kind:
+                child.original_kind = child.original_kind or child.kind
+                child.kind = new_kind
         self._check_duplicates(inst, doc, node)
         if inst.args.get("reorder") and self._move_into_order(node, new_kind, inst.cite) is None:
             raise _NotApplied(f"Not applied: the {new_kind}s of {_describe(node, doc)} can't be put in order by "
@@ -964,6 +966,7 @@ class Engine:
         for position, i in enumerate(originals):
             if position not in staying:
                 nodes[i].mark_moved(source)
+                nodes[i].moved_by = source
         if node.original_order is None:
             node.original_order = list(node.children)
         for slot, i in zip(slots, order):

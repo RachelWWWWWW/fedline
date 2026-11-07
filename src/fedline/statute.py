@@ -120,6 +120,10 @@ class Node:
     # The children in their order before the bill moved any, kept so the original text can still be read
     # in order.
     original_order: list["Node"] | None = field(default=None, compare=False, repr=False)
+    # Set on a provision the bill moves: the instruction that moved it. Its old place is shown too.
+    moved_by: str = field(default="", compare=False)
+    # The kind before a redesignation changed it, as when subsections become paragraphs.
+    original_kind: str = field(default="", compare=False)
 
     def texts(self, headings: bool = True):
         """Yield this subtree's text blocks in reading order."""

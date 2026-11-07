@@ -1,6 +1,7 @@
 """End-to-end and unit tests, using H.R. 10453 and the Code sections it amends."""
 
 import os
+import re
 import tempfile
 import unittest
 import zipfile
@@ -234,6 +235,19 @@ class RedesignateTests(unittest.TestCase):
         # Swapping two, the first stays and the second, (1), the former (b), is marked as moved before it.
         self.assertIn(moved + "“lease” means a lease.</w:t>", document)
         self.assertIn(moved + "moved text</w:t>", document)  # the key
+        # Its old place, after (a) and before (c), with the old designation, as a subsection, purple and
+        # double-struck.
+        was = '<w:color w:val="7030A0"/></w:rPr><w:t xml:space="preserve">'
+        old_place = ('<w:p><w:r><w:rPr><w:b/><w:dstrike/>' + was + '(b)</w:t></w:r>'
+                     '<w:r><w:t xml:space="preserve"> </w:t></w:r><w:r><w:rPr><w:dstrike/>' + was +
+                     '“lease” means a lease.</w:t></w:r>')
+        self.assertIn(old_place, document)
+        paragraphs = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<w:p>.*?</w:p>", document)]
+        start = paragraphs.index("§ 1001. In this chapter:")
+        self.assertEqual(paragraphs[start + 1:start + 5], [
+            "(b)(1) “lease” means a lease.", "(a)(2) “Secretary” means the Secretary.", "(b) “lease” means a lease.",
+            "(c) “byproduct” means a mineral."])
+        self.assertIn('<w:dstrike/><w:color w:val="7030A0"/></w:rPr><w:t xml:space="preserve">where it was', document)
 
     def test_moving_subdivisions_already_in_order_needs_no_flag(self):
         _, outcome, _ = self.run_bill(

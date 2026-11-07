@@ -317,6 +317,9 @@ class MoreShapesTests(unittest.TestCase):
             '<subsection><num value="f">(f)</num><chapeau>In this section:</chapeau>'
             '<paragraph><num value="1">(1)</num><content>“Secretary” means the Secretary.</content></paragraph>'
             '<paragraph><num value="2">(2)</num><content>“lease” means a lease.</content></paragraph></subsection>'
+            '<subsection><num value="n">(n)</num><content>Any person, as defined by section 3(1), may seek review in '
+            'the court for (1) any circuit where the action occurs, or (2) the District of Columbia, within 90 days.'
+            '</content></subsection>'
             '<subsection><num value="t">(t)</num><heading>Navigable waters</heading><content>Nothing in this '
             'section shall preclude a State.</content></subsection>'
             '<sourceCredit>(Pub. L. 93–205, § 7, Dec. 28, 1973.)</sourceCredit></section></main></uscDoc>').encode()
@@ -379,6 +382,25 @@ class MoreShapesTests(unittest.TestCase):
                          ("[-(t)-][+(u)+]", "[-Navigable waters-][+Savings provision+]",
                           "Nothing in this section shall preclude a State."))
         self.assertIsNone(root.live_child("t"))
+
+    def test_designations_run_into_the_text_are_redesignated_there(self):
+        # 16 U.S.C. 1536(n) runs "(1) any circuit …, or (2) …" into its text. The "(1)" in "section 3(1)" is a
+        # citation, not a designation.
+        outcome, root = self.run_bill("<text>in subsection (n), by redesignating paragraphs (1) and (2) as "
+                                      "subparagraphs (A) and (B), respectively.</text>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual(marked(root.live_child("n").body),
+                         "Any person, as defined by section 3(1), may seek review in the court for [-(1)-][+(A)+] any "
+                         "circuit where the action occurs, or [-(2)-][+(B)+] the District of Columbia, within 90 days.")
+        self.assertEqual([f.blocking for f in outcome.flags], [False])
+        self.assertIn("runs paragraphs (1) and (2) into the text of", outcome.flags[0].message)
+
+    def test_run_in_designations_out_of_order_or_missing_arent_guessed(self):
+        for values in ("(2) and (1) as subparagraphs (A) and (B)", "(1) and (3) as subparagraphs (A) and (B)"):
+            outcome, _ = self.run_bill(f"<text>in subsection (n), by redesignating paragraphs {values}, "
+                                       "respectively.</text>")
+            self.assertEqual(outcome.applied, 0, values)
+            self.assertIn("wasn't found", outcome.flags[0].message)
 
     def test_text_inserted_after_a_designation(self):
         outcome, root = self.run_bill("<text>in subsection (f), in each of paragraphs (1) and (2), by inserting "

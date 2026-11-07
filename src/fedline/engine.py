@@ -984,6 +984,10 @@ class Engine:
         kind, old, new = inst.args["kind"], inst.args["old"], inst.args["new"]
         if len(old) != len(new):
             raise _NotApplied("Not applied: the old and new designations don't line up.", doc, node)
+        if not any(node.live_child(value, kind) for value in old) and not inst.args.get("reorder"):
+            found = self._run_in(inst, doc, node, old)
+            if found:
+                return self._redesignate_run_in(inst, doc, node, found)
         targets = self._children(inst, doc, node, old, kind)
         new_kind = inst.args.get("new_kind", kind)
         for child, value in zip(targets, new):
@@ -997,6 +1001,35 @@ class Engine:
         if inst.args.get("reorder") and self._move_into_order(node, new_kind, inst.cite) is None:
             raise _NotApplied(f"Not applied: the {new_kind}s of {_describe(node, doc)} can't be put in order by "
                               "their designations.", doc, node)
+        return True
+
+    def _run_in(self, inst, doc, node, old) -> list[tuple[Text, re.Match]] | None:
+        """Designations run into the provision's text, as in 16 U.S.C. 1536(n): "…for (1) any circuit …, or
+        (2) in any case …". Each must appear exactly once, standing alone, and in order."""
+        own = {id(node.body), id(node.tail)} | {id(c.body) for c in node.children if c.kind == "continuation"}
+        windows = [w for w in self._scope(inst, doc, node) if id(w[0]) in own]
+        found = []
+        for value in old:
+            pattern = rf"(?<![\w)\]]){re.escape(f'({value})')}(?= )"
+            hits = [(text, m) for text, start, end in windows
+                    for m in re.finditer(pattern, text.current()) if start <= m.start() and m.end() <= end]
+            if len(hits) != 1:
+                return None
+            found.append(hits[0])
+        texts = [text for text, _ in found]
+        if any(t is not texts[0] for t in texts) or [m.start() for _, m in found] != sorted(m.start() for _, m in found):
+            return None
+        return found
+
+    def _redesignate_run_in(self, inst, doc, node, found) -> bool:
+        kind, old, new = inst.args["kind"], inst.args["old"], inst.args["new"]
+        for (text, match), value in reversed(list(zip(found, new))):
+            _swap(text, match.start(), match.end(), f"({value})", inst.cite)
+        labels = [f"({v})" for v in old]
+        names = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + f" and {labels[-1]}"
+        self._flag(inst.cite, f"The Code runs {kind}s {names} into the text of {_describe(node, doc)} rather than "
+                              "setting them out as provisions. They're redesignated there, in the text.",
+                   False, doc, node)
         return True
 
     def _reorder(self, inst, doc, node) -> bool:

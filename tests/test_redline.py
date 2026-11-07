@@ -255,6 +255,38 @@ class RedesignateTests(unittest.TestCase):
             "indenting and moving the paragraphs so as to appear in numerical order.</text>")
         self.assertEqual((outcome.applied, outcome.flags), (1, []))
 
+    def test_the_old_place_reads_as_it_was_when_the_bill_also_split_the_text(self):
+        # As in 42 U.S.C. 4336(b)(2): the bill splits the text into a new subparagraph (A), then moves the
+        # provision. Where it was, the text ran on in one line, so the old place shows it that way.
+        bill, outcome, root = self.run_bill(
+            "<text>in subsection (a), by striking <quote>“Secretary” means</quote> and inserting the following:"
+            "</text><quoted-block><subparagraph><enum>(A)</enum><header>In general</header><text>The term "
+            "<term>Secretary</term> means</text></subparagraph></quoted-block>",
+            "<text>by redesignating subsections (a) through (c) as paragraphs (3), (1), and (2), respectively, and "
+            "moving the paragraphs so as to appear in numerical order.</text>")
+        self.assertEqual((outcome.applied, outcome.flags), (2, []))
+        moved = root.children[2]
+        self.assertEqual((moved.value, moved.moved_by), ("3", "§ 2(2)"))
+        self.assertEqual(marked(moved.children[0].body), "[+The term “Secretary” means+][~ the Secretary.~]")
+        passed = verify(bill, outcome)
+        self.assertIn("Original text in the redline matches the source XML in every section.", passed)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "ih", passed)
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        paragraphs = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<w:p>.*?</w:p>", document)]
+        start = paragraphs.index("§ 1001. In this chapter:")
+        self.assertEqual(paragraphs[start + 1:start + 6], [
+            "(a) “Secretary” means the Secretary.",  # the old place, in one line
+            "(b)(1) “lease” means a lease.",
+            "(c)(2) “byproduct” means a mineral.",
+            "(a)(3) “Secretary” means",
+            "(A) In general The term “Secretary” means the Secretary."])
+        old_place = next(p for p in re.findall(r"<w:p>.*?</w:p>", document)
+                         if re.sub(r"<[^>]+>", "", p) == paragraphs[start + 1])
+        texts = re.findall(r"<w:r>(.*?)</w:r>", old_place)
+        self.assertTrue(all("<w:dstrike/>" in t for t in texts if re.sub(r"<[^>]+>", "", t).strip()))
+
     def test_a_separate_instruction_to_reorder(self):
         _, outcome, root = self.run_bill(
             "<text>by redesignating subsections (a) and (b) as subsections (b) and (a), respectively;</text>",

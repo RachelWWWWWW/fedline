@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 
-from .bill import Bill, Instruction, Target
+from .bill import _ROMANS, Bill, Instruction, Target
 from .statute import INS, LEVELS, Act, CodeTitle, Document, Node, Segment, Text, norm
 
 
@@ -444,6 +444,8 @@ class Engine:
             return True
         if action == "redesignate":
             return self._redesignate(inst, doc, node)
+        if action == "reorder":
+            return self._reorder(inst, doc, node)
         if action == "indent":
             # The words don't change, and the redline indents each subdivision by its level, so there's
             # nothing to mark. The subdivisions are still checked, so a wrong reference isn't counted.
@@ -922,10 +924,48 @@ class Engine:
         if len(old) != len(new):
             raise _NotApplied("Not applied: the old and new designations don't line up.", doc, node)
         targets = self._children(inst, doc, node, old, kind)
+        new_kind = inst.args.get("new_kind", kind)
         for child, value in zip(targets, new):
             child.renumber(value, inst.cite)
+            # "Subsections (a) through (g) as paragraphs (8), (4), …" makes them paragraphs, which also sets
+            # their indentation.
+            child.kind = new_kind
         self._check_duplicates(inst, doc, node)
+        if inst.args.get("reorder"):
+            order = self._out_of_order(node, new_kind)
+            if order:
+                self._flag(inst.cite, f"Applied in part: the {kind}s are redesignated, but the instruction also moves "
+                                      f"them into numerical order, which this redline doesn't show yet. They're "
+                                      f"shown in the Code's order: {order}. Check the order by hand.", True, doc, node)
         return True
+
+    def _reorder(self, inst, doc, node) -> bool:
+        """'By moving the paragraphs so as to appear in numerical order'. Moved text isn't shown yet, so only
+        subdivisions already in order count as applied."""
+        kind = inst.args["kind"]
+        order = self._out_of_order(node, kind)
+        if order is None:
+            raise _NotApplied(f"Not applied: the {kind}s of {_describe(node, doc)} can't be put in order by their "
+                              "designations.", doc, node)
+        if order:
+            raise _NotApplied(f"Not applied: moving the {kind}s of {_describe(node, doc)} into numerical order "
+                              f"isn't shown yet. They're in this order: {order}.", doc, node)
+        return True
+
+    @staticmethod
+    def _out_of_order(node: Node, kind: str) -> str | None:
+        """The designations of node's subdivisions of kind, as "(8), (4), …", when they're out of numerical order;
+        "" when they're in order; None when the designations can't be ordered."""
+        values = [c.value for c in node.children if not c.deleted and c.kind == kind]
+        if all(v.isdigit() for v in values):
+            keys = [int(v) for v in values]
+        elif all(len(v) == 1 and v.isalpha() for v in values):
+            keys = [ord(v) for v in values]
+        elif all(v.lower() in _ROMANS for v in values):
+            keys = [_ROMANS.index(v.lower()) for v in values]
+        else:
+            return None
+        return "" if keys == sorted(keys) else ", ".join(f"({v})" for v in values)
 
     def _redesignate_sections(self, inst, act: Act) -> bool:
         old, new = inst.args["old"], inst.args["new"]

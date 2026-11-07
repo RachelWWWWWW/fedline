@@ -177,6 +177,65 @@ class ActNameTests(unittest.TestCase):
         self.assertGreater(new.order, find_doc(outcome, "16 U.S.C. § 824").order)
 
 
+class RedesignateTests(unittest.TestCase):
+    """S. 5653 § 2222(a)(1)(F): "by redesignating subsections (a) through (g) as paragraphs (8), (4), …,
+    respectively, and indenting and moving the paragraphs so as to appear in numerical order"."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>30</docNumber></meta><main>'
+            '<section identifier="/us/usc/t30/s1001"><num value="1001">§ 1001.</num><chapeau>In this chapter:'
+            '</chapeau><subsection><num value="a">(a)</num><content>“Secretary” means the Secretary.</content>'
+            '</subsection><subsection><num value="b">(b)</num><content>“lease” means a lease.</content>'
+            '</subsection><subsection><num value="c">(c)</num><content>“byproduct” means a mineral.</content>'
+            '</subsection><sourceCredit>(Pub. L. 91–581, § 2, Dec. 24, 1970.)</sourceCredit></section>'
+            '</main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum>{text}</paragraph>" for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>Section 2 of the Geothermal Steam Act of 1970 "
+                              f"(30 U.S.C. 1001) is amended—</text>{items}</section>")
+        outcome = apply_bill(bill, {30: CodeTitle(self.CODE)})
+        docs = [d for d in outcome.documents if d.title == "30 U.S.C. § 1001"]
+        return bill, outcome, docs[0].root if docs else None
+
+    def test_redesignated_subdivisions_take_the_new_kind(self):
+        bill, outcome, root = self.run_bill(
+            "<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), respectively, and "
+            "indenting appropriately;</text>",
+            "<text>by inserting after paragraph (2) the following:</text><quoted-block><paragraph><enum>(2A)</enum>"
+            "<text>“mineral” means a mineral.</text></paragraph></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (2, []))
+        self.assertEqual([(c.kind, c.value) for c in root.children],
+                         [("paragraph", "1"), ("paragraph", "2"), ("paragraph", "2A"), ("paragraph", "3")])
+
+    def test_moving_into_numerical_order_isnt_dropped(self):
+        bill, outcome, root = self.run_bill(
+            "<text>by redesignating subsections (a) through (c) as paragraphs (3), (1), and (2), respectively, and "
+            "indenting and moving the paragraphs so as to appear in numerical order.</text>")
+        self.assertTrue(bill.instructions[0].args["reorder"])
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual([c.value for c in root.children], ["3", "1", "2"])  # the Code's order, with a flag
+        self.assertEqual([f.blocking for f in outcome.flags], [True])
+        self.assertIn("Applied in part", outcome.flags[0].message)
+        self.assertIn("(3), (1), (2)", outcome.flags[0].message)
+
+    def test_moving_subdivisions_already_in_order_needs_no_flag(self):
+        _, outcome, _ = self.run_bill(
+            "<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), respectively, and "
+            "indenting and moving the paragraphs so as to appear in numerical order.</text>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+
+    def test_a_separate_instruction_to_reorder(self):
+        _, outcome, _ = self.run_bill(
+            "<text>by redesignating subsections (a) and (b) as subsections (b) and (a), respectively;</text>",
+            "<text>by moving the subsections so as to appear in numerical order.</text>")
+        self.assertEqual((outcome.applied, outcome.failed), (1, 1))
+        self.assertIn("isn't shown yet. They're in this order: (b), (a), (c).", outcome.flags[-1].message)
+
+    def test_other_words_after_the_designations_arent_swallowed(self):
+        bill, _, _ = self.run_bill("<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), "
+                                   "respectively, and striking the definitions.</text>")
+        self.assertEqual([p.reason for p in bill.problems], ["instruction wording isn't a recognized pattern"])
+
+
 class CodeWordingTests(unittest.TestCase):
     """The Code's editors reword an Act's text: its own section numbers for the Act's, "this chapter" for
     "this Act", dates for "the date of enactment", curly apostrophes. A phrase quoted from the Act is matched

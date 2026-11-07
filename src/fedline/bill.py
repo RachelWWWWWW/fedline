@@ -447,13 +447,25 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
         if values:
             return "indent", {"kind": kind, "values": values}
 
-    match = re.fullmatch(rf"by redesignating ({kinds}) (.+?) as ({kinds}) (.+?)(?:, respectively)?", text)
+    # Only designations, so trailing words such as "and moving the paragraphs so as to appear in numerical
+    # order" are read rather than swallowed.
+    designations = r"(?:\(\w+\)|\d+\w*)(?:(?:,? and |, | through )(?:\(\w+\)|\d+\w*))*"
+    match = re.fullmatch(
+        rf"by redesignating ({kinds}) ({designations}) as ({kinds}) ({designations})(?:,? respectively)?"
+        rf"(?:,? and (?:indenting appropriately|(?P<move>(?:indenting and )?moving the (?:{kinds}) so as to "
+        r"appear in numerical order)))?", text)
     if match:
         kind = _LEVEL_WORDS[match.group(1)]
         old = _designators(match.group(2), kind)
-        new = _designators(match.group(4), _LEVEL_WORDS[match.group(3)])
+        new_kind = _LEVEL_WORDS[match.group(3)]
+        new = _designators(match.group(4), new_kind)
         if old and new:
-            return "redesignate", {"kind": kind, "old": old, "new": new}
+            return "redesignate", {"kind": kind, "old": old, "new": new, "new_kind": new_kind,
+                                   "reorder": bool(match.group("move"))}
+
+    match = re.fullmatch(rf"by moving the ({kinds}) so as to appear in numerical order", text)
+    if match:
+        return "reorder", {"kind": _LEVEL_WORDS[match.group(1)]}
 
     match = re.fullmatch(
         rf"by striking the ({_ORDINAL}) sentence(?: and inserting the following:? ⟦(?P<b>\d+)⟧)?", text)

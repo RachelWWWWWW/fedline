@@ -172,6 +172,10 @@ def _parse_target(match: re.Match) -> Target | None:
         target.title = int(usc.group(1))
         target.usc_section = usc.group(2)
         target.is_note = (usc.group(3) or "").strip() == "note"
+        # "(42 U.S.C. 3211 note; Public Law 118–272)": the Public Law finds the note exactly, even when the
+        # note's text doesn't give the Act's name.
+        if target.is_note and public_law:
+            target.public_law = f"{public_law.group(1)}-{public_law.group(2)}"
     elif public_law:
         target.public_law = f"{public_law.group(1)}-{public_law.group(2)}"
         target.is_note = True

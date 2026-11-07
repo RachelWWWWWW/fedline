@@ -189,7 +189,7 @@ class Engine:
                 doc = title.note_for_public_law(target.public_law, target.section or "")
                 if doc:
                     break
-        else:
+        if doc is None and target.usc_section:
             title = self.titles.get(target.title)
             if title is not None:
                 doc = title.note_for_act(target.usc_section, target.name)

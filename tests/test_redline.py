@@ -288,6 +288,43 @@ class EachOfTests(unittest.TestCase):
         self.assertEqual([f.message for f in outcome.flags], [])
 
 
+class NoteLookupTests(unittest.TestCase):
+    """Pub. L. 118–272 § 2232 is reproduced in a note to 42 U.S.C. 3211 under a heading, "Modernization of
+    Environmental Reviews", that doesn't give the Act's name."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>42</docNumber></meta><main>'
+            '<section identifier="/us/usc/t42/s3211"><num value="3211">§ 3211.</num><content>Text.</content>'
+            '<sourceCredit>(Pub. L. 89–136, title VI, § 601.)</sourceCredit><notes><note topic="miscellaneous">'
+            '<heading>Modernization of Environmental Reviews</heading><p>Pub. L. 118–272, div. B, title II, '
+            '§ 2232, provided that:<quotedContent origin="/us/pl/118/272/dB/tII/s2232"><subsection>'
+            '<num value="a">“(a)</num><heading> In General.—</heading><content>The Secretary shall report on '
+            'exclusions (as defined in section 111 of the National Environmental Policy Act of 1969 '
+            '(42 U.S.C. 4336e)).</content></subsection></quotedContent></p></note></notes></section>'
+            '</main></uscDoc>').encode()
+
+    def run_bill(self, cite):
+        bill = parse_sections(
+            f"<section><enum>2.</enum><text>Section 2232(a) of the Economic Development Reauthorization Act of 2024 "
+            f"({cite}) is amended by striking <quote>section 111 of the National Environmental Policy Act of 1969 "
+            "(42 U.S.C. 4336e)</quote> and inserting <quote>section 3 of the National Environmental Policy Act of "
+            "1969</quote>.</text></section>")
+        self.assertEqual(bill.problems, [])
+        return bill.instructions[0].target, apply_bill(bill, {42: CodeTitle(self.CODE)})
+
+    def test_public_law_in_a_note_citation_finds_the_note(self):
+        target, outcome = self.run_bill("42 U.S.C. 3211 note; Public Law 118–272")
+        self.assertEqual((target.is_note, target.usc_section, target.public_law), (True, "3211", "118-272"))
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        doc = find_doc(outcome, "42 U.S.C. § 3211 note (Pub. L. 118-272, § 2232)")
+        self.assertIn("[-section 111 of the National Environmental Policy Act of 1969 (42 U.S.C. 4336e)-]"
+                      "[+section 3 of the National Environmental Policy Act of 1969+]", marked(doc.root.children[0].body))
+
+    def test_without_the_public_law_an_unnamed_note_is_still_flagged(self):
+        target, outcome = self.run_bill("42 U.S.C. 3211 note")
+        self.assertIsNone(target.public_law)
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("wasn't found in the Code notes", outcome.flags[0].message)
+
+
 class CreditTests(unittest.TestCase):
     def test_public_law(self):
         self.assertEqual(credit_origin("(Pub. L. 104–104, § 3, Feb. 8, 1996, 110 Stat. 56.)"),

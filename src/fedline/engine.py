@@ -737,8 +737,17 @@ class Engine:
             parent.children[position:position] = blocks
             self._check_duplicates(inst, doc, parent)
             return
-        node.children[0:0] = blocks
-        self._check_duplicates(inst, doc, node)
+        container = _container_for(blocks[-1], node.children)
+        if container is None:
+            node.children[0:0] = blocks
+            self._check_duplicates(inst, doc, node)
+            return
+        # Subdivisions an earlier instruction split off from later text follow the moved text in reading
+        # order, so they go under the new subdivision that holds it: in 54 U.S.C. 306108, the new (2) split
+        # from the second sentence belongs in the (b) later split from the first, after (b)(1).
+        container.children.extend(node.children)
+        node.children = blocks
+        self._check_duplicates(inst, doc, container)
 
     def _edit_sentence(self, inst, doc, node) -> bool:
         """'By striking the second sentence', 'by inserting after the first sentence the following: "…"'."""
@@ -949,6 +958,22 @@ def _walk_nodes(node: Node):
     yield node
     for child in node.children:
         yield from _walk_nodes(child)
+
+
+def _container_for(block: Node, existing: list[Node]) -> Node | None:
+    """The deepest node along block's last-child chain whose last child is at the level of the existing
+    subdivisions, which then continue after it. None when there are none, they're at mixed levels, or no
+    level matches, as when they're at the block's own level and simply follow it."""
+    kinds = {c.kind for c in existing if not c.deleted and c.kind != "continuation"}
+    if len(kinds) != 1:
+        return None
+    kind = kinds.pop()
+    found, node = None, block
+    while node.children:
+        if node.children[-1].kind == kind:
+            found = node
+        node = node.children[-1]
+    return found
 
 
 def _describe(node: Node, doc: Document) -> str:

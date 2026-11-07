@@ -656,6 +656,25 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(marked(second.body), "[+The location fee+] is $5.")
         self.assertEqual(node.before_text(), "(b)The fee is due. The location fee is $5.")
 
+    def test_subdivisions_split_off_earlier_move_under_the_new_one_that_precedes_them(self):
+        # 54 U.S.C. 306108: S. 5653 § 2301(c)(1) makes the second sentence paragraph (2), then (c)(2) makes the
+        # first sentence subsection (b) with paragraph (1). (2) belongs in (b), after (1).
+        node = Node("section", "306108", label=Text("§ 306108."),
+                    body=Text("The head of any Federal agency having direct jurisdiction shall act. "
+                              "The head of the Federal agency shall afford comment."))
+        self.apply(node, "The head of the Federal agency",
+                   [new_node("paragraph", "2", "Opportunity to comment", "The head of any agency")], [("sentence", 2)])
+        self.apply(node, "The head of any Federal agency having direct", [new_node(
+            "subsection", "b", "Adverse effect", children=[new_node("paragraph", "1", "In general", "The head")])],
+            [("sentence", 1)])
+        (subsection,) = node.children
+        self.assertEqual([(c.kind, c.value) for c in subsection.children], [("paragraph", "1"), ("paragraph", "2")])
+        self.assertEqual(marked(subsection.children[0].body), "[+The head+] jurisdiction shall act. "
+                                                              "[-The head of the Federal agency-]")
+        self.assertEqual(marked(subsection.children[1].body), "[+The head of any agency+] shall afford comment.")
+        self.assertEqual(node.before_text(), "§ 306108.The head of any Federal agency having direct jurisdiction "
+                                             "shall act. The head of the Federal agency shall afford comment.")
+
     def test_existing_subdivisions_block_a_split(self):
         node = Node("paragraph", "1", label=Text("(1)"), body=Text("The Secretary shall—"),
                     children=[Node("subparagraph", "A", label=Text("(A)"), body=Text("act."))])

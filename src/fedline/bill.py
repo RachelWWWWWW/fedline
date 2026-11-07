@@ -255,9 +255,9 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
     heading = False
     text = _AS_NOTE.sub("", text)
     while True:
-        match = re.match(rf"^in the ({_ORDINAL}) sentence{_SEP}", text)
+        match = re.match(rf"^in the ({_ORDINAL}) (sentence|proviso){_SEP}", text)
         if match:
-            within.append(("sentence", _ORDINALS[match.group(1)]))
+            within.append((match.group(2), _ORDINALS[match.group(1)]))
             text = text[match.end():]
             continue
         match = re.match(rf"^in the (?:undesignated )?matter (preceding|following) (\w+) \((\w+)\){_SEP}", text)
@@ -399,6 +399,10 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
             "start": q(match, "a"), "end": q(match, "c") if match.group("c") else None,
             "end_punct": _PUNCTUATION.get(match.group("pc") or ""),
             "new": new_text(match)}
+
+    match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ after the (?P<unit>\w+) designation", text)
+    if match and match.group("unit") in LEVELS:
+        return "insert_at_start", {"new": q(match, "a"), "unit": match.group("unit")}
 
     match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ before ⟦(?P<b>\d+)⟧", text)
     if match:

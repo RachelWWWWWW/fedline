@@ -300,6 +300,100 @@ class RedesignateTests(unittest.TestCase):
         self.assertEqual([p.reason for p in bill.problems], ["instruction wording isn't a recognized pattern"])
 
 
+class MoreShapesTests(unittest.TestCase):
+    """S. 5653 §§ 1205(1), 1302(2)(D)(ii), 2232 and 2222(a)(1)(G)(i)."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s1536"><num value="1536">§ 1536.</num>'
+            '<subsection><num value="b">(b)</num><paragraph><num value="1">(1)</num>'
+            '<subparagraph><num value="A">(A)</num><content>Consultation shall end.</content></subparagraph>'
+            '<subparagraph><num value="B">(B)</num><chapeau>The Secretary may not agree—</chapeau>'
+            '<clause><num value="i">(i)</num><content>first;</content></clause>'
+            '<clause><num value="ii">(ii)</num><content>second,</content></clause>'
+            '<continuation>unless the applicant consents. The Secretary may extend the period.</continuation>'
+            '</subparagraph></paragraph></subsection>'
+            '<subsection><num value="e">(e)</num><content>Licenses within any reservation shall protect the use '
+            'of such reservation: Provided, That the Secretary shall deem the use of such reservation necessary: '
+            'Provided further, That no license shall affect the use of such reservation.</content></subsection>'
+            '<subsection><num value="f">(f)</num><chapeau>In this section:</chapeau>'
+            '<paragraph><num value="1">(1)</num><content>“Secretary” means the Secretary.</content></paragraph>'
+            '<paragraph><num value="2">(2)</num><content>“lease” means a lease.</content></paragraph></subsection>'
+            '<subsection><num value="t">(t)</num><heading>Navigable waters</heading><content>Nothing in this '
+            'section shall preclude a State.</content></subsection>'
+            '<sourceCredit>(Pub. L. 93–205, § 7, Dec. 28, 1973.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum>{text}</paragraph>" for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>Section 7 of the Endangered Species Act of 1973 "
+                              f"(16 U.S.C. 1536) is amended—</text>{items}</section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        self.assertIn("Original text in the redline matches the source XML in every section.", verify(bill, outcome))
+        docs = [d for d in outcome.documents if d.title == "16 U.S.C. § 1536"]
+        return outcome, docs[0].root if docs else None
+
+    def test_matter_after_the_last_subdivision_becomes_a_new_provision_after_it(self):
+        outcome, root = self.run_bill(
+            "<text>in subsection (b)(1)(B), in the undesignated matter following clause (ii), by striking "
+            "<quote>The Secretary may extend</quote> and inserting the following:</text><quoted-block><subparagraph>"
+            "<enum>(C)</enum><text>The Secretary may extend</text></subparagraph></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        paragraph = root.live_child("b").live_child("1")
+        self.assertEqual([c.value for c in paragraph.children], ["A", "B", "C"])
+        subparagraph_b, subparagraph_c = paragraph.children[1:]
+        self.assertEqual([c.value for c in subparagraph_b.children], ["i", "ii"])  # the clauses stay
+        self.assertEqual(marked(subparagraph_b.tail), "unless the applicant consents. [-The Secretary may extend-]")
+        self.assertEqual(marked(subparagraph_c.body), "[+The Secretary may extend+] the period.")
+
+    def test_matter_after_subdivisions_cant_become_a_deeper_provision(self):
+        outcome, _ = self.run_bill(
+            "<text>in subsection (b)(1)(B), in the undesignated matter following clause (ii), by striking "
+            "<quote>The Secretary may extend</quote> and inserting the following:</text><quoted-block><clause>"
+            "<enum>(iii)</enum><text>The Secretary may extend</text></clause></quoted-block>")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("only the matter after the last subdivision", outcome.flags[0].message)
+
+    def test_an_edit_in_a_proviso_stays_in_it(self):
+        # "of such reservation" appears in the text before the provisos, in the first and in the second.
+        outcome, root = self.run_bill("<text>in subsection (e), in the first proviso, by inserting <quote>and are "
+                                      "reasonable</quote> after <quote>of such reservation</quote>.</text>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        self.assertEqual(marked(root.live_child("e").body),
+                         "Licenses within any reservation shall protect the use of such reservation: Provided, That "
+                         "the Secretary shall deem the use of such reservation[+ and are reasonable+] necessary: "
+                         "Provided further, That no license shall affect the use of such reservation.")
+
+    def test_a_missing_proviso_isnt_guessed(self):
+        outcome, _ = self.run_bill("<text>in subsection (e), in the third proviso, by inserting <quote>X</quote> "
+                                   "after <quote>of such reservation</quote>.</text>")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("doesn't have a third proviso (it has 2)", outcome.flags[0].message)
+
+    def test_a_struck_designation_gives_way_to_the_new_one(self):
+        outcome, root = self.run_bill(
+            "<text>in subsection (t), by striking <quote>(t) Nothing in this section</quote> and inserting the "
+            "following:</text><quoted-block><subsection><enum>(u)</enum><header>Savings provision</header><text>"
+            "Nothing in this section</text></subsection></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        subsection = root.live_child("u")
+        self.assertEqual((marked(subsection.label), marked(subsection.heading), marked(subsection.body)),
+                         ("[-(t)-][+(u)+]", "[-Navigable waters-][+Savings provision+]",
+                          "Nothing in this section shall preclude a State."))
+        self.assertIsNone(root.live_child("t"))
+
+    def test_text_inserted_after_a_designation(self):
+        outcome, root = self.run_bill("<text>in subsection (f), in each of paragraphs (1) and (2), by inserting "
+                                      "<quote>The term</quote> after the paragraph designation.</text>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        self.assertEqual([marked(c.body) for c in root.live_child("f").children],
+                         ["[+The term +]“Secretary” means the Secretary.", "[+The term +]“lease” means a lease."])
+
+    def test_text_after_a_designation_must_name_the_right_level(self):
+        outcome, _ = self.run_bill("<text>in subsection (f)(1), by inserting <quote>The term</quote> after the "
+                                   "subsection designation.</text>")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("isn't a subsection with text after its designation", outcome.flags[0].message)
+
+
 class CodeWordingTests(unittest.TestCase):
     """The Code's editors reword an Act's text: its own section numbers for the Act's, "this chapter" for
     "this Act", dates for "the date of enactment", curly apostrophes. A phrase quoted from the Act is matched

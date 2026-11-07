@@ -84,7 +84,6 @@ If the run stops with an error:
 ## Current limits
 
 - Instructions are parsed by pattern matching. Wording the parser doesn't recognize is flagged and listed, not applied. The LLM step for harder wording isn't built yet. Wording not yet recognized includes:
-  - "in the first proviso"
   - moving text, other than putting subdivisions in numerical order.
 - Moved text is shown twice: where the bill moves it, purple and double-underlined, and where it was, purple and double-struck, with its old designation. When subdivisions are put in numerical order, only the fewest needed to explain the new order are marked as moved.
 - An instruction that only changes indentation, such as "by indenting clauses (i) through (v) appropriately", is applied without marks, because the redline indents each provision by its level. It's flagged to review.

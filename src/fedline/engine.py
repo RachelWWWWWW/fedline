@@ -446,6 +446,13 @@ class Engine:
             return self._redesignate(inst, doc, node)
         if action == "reorder":
             return self._reorder(inst, doc, node)
+        if action == "insert_at_start":
+            # "By inserting “The term” after the paragraph designation": the start of the provision's text.
+            if node.kind != inst.args["unit"] or not node.body.current():
+                raise _NotApplied(f"Not applied: {_describe(node, doc)} isn't a {inst.args['unit']} with text after "
+                                  "its designation.", doc, node)
+            node.body.insert(0, f"{inst.args['new']} ", (inst.cite,))
+            return True
         if action == "indent":
             # The words don't change, and the redline indents each subdivision by its level, so there's
             # nothing to mark. The subdivisions are still checked, so a wrong reference isn't counted.
@@ -514,6 +521,9 @@ class Engine:
             if part[0] == "sentence":
                 windows = [self._sentence(self._sentence_base(windows, part[1], doc, node), part[1], doc, node)]
                 continue
+            if part[0] == "proviso":
+                windows = [self._proviso(windows, part[1], doc, node)]
+                continue
             where, kind, value = part
             live = [c for c in node.children if not c.deleted]
             child = node.live_child(value, kind)
@@ -531,6 +541,18 @@ class Engine:
                                   doc, node)
             windows = [(text, 0, len(text.current()))]
         return windows
+
+    def _proviso(self, windows, n, doc, node) -> tuple[Text, int, int]:
+        """The nth proviso: from its "Provided" to the next proviso or the end of that block of text."""
+        starts = [(text, m.start(), end) for text, start, end in windows
+                  for m in re.finditer(r"\bProvided(?:,? (?:further|however|also))*,? [Tt]hat\b", text.current())
+                  if start <= m.start() < end]
+        if n > len(starts) or not starts:
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't have a {_ordinal(n)} proviso "
+                              f"(it has {len(starts)}).", doc, node)
+        text, begin, end = starts[n - 1 if n > 0 else -1]
+        following = [s for t, s, _ in starts if t is text and s > begin]
+        return text, begin, following[0] if following else end
 
     def _sentence_base(self, windows, n, doc, node) -> tuple[Text, int, int]:
         """The window that sentence n is counted in. With subdivisions, that's the introductory text, which
@@ -750,6 +772,15 @@ class Engine:
         block = blocks[0]
         target = next((n for n in [node] + [c for c in node.children if not c.deleted]
                        if (n.kind, n.value) == (block.kind, block.value)), None)
+        if target is None and block.kind == node.kind and node is not doc.root and node.label.current().strip()                 and old.startswith(node.label.current().strip()):
+            # 'In subsection (t), by striking "(t) Nothing in this section" and inserting (u) Savings provision.—
+            # Nothing in this section': the struck designation gives way to the new one.
+            self._overlay(inst, doc, node, old, block)
+            node.renumber(block.value, inst.cite)
+            parent = next((p for p in _walk_nodes(doc.root) if node in p.children), None)
+            if parent is not None:
+                self._check_duplicates(inst, doc, parent)
+            return True
         if target is None:
             raise _NotApplied(f"Not applied: the new {block.kind} ({block.value}) doesn't match {_describe(node, doc)} "
                               "or any of its subdivisions.", doc, node)
@@ -836,6 +867,8 @@ class Engine:
         the text that followed old into the last of them. Run-in text the new subdivisions follow, as in
         "the Secretary—", takes old's place. New provisions at node's own level, as in 'in
         paragraph (1), by striking "to promote" and inserting (2) to promote', follow node instead."""
+        if inst.within and inst.within[-1][0] == "following":
+            return self._split_trailing(inst, doc, node, old, blocks, lead)
         if any(c.label.before() for c in node.children if not c.deleted):
             raise _NotApplied(f"Not applied: {_describe(node, doc)} already has subdivisions, and the instruction "
                               "doesn't say whether they move under the new ones.", doc, node)
@@ -879,6 +912,34 @@ class Engine:
         container.children.extend(node.children)
         node.children = blocks
         self._check_duplicates(inst, doc, container)
+
+    def _split_trailing(self, inst, doc, node, old, blocks, lead) -> None:
+        """'In the matter following clause (ii), by striking "The Secretary" and inserting (C) The Secretary':
+        the text after a provision's last subdivision, from old on, becomes new provisions at its own level,
+        right after it. The subdivisions stay where they are."""
+        windows = self._scope(inst, doc, node)
+        text = windows[0][0]
+        parent = next((p for p in _walk_nodes(doc.root) if node in p.children), None)
+        if text is not node.tail or parent is None or any(b.kind != node.kind for b in blocks):
+            raise _NotApplied(f"Not applied: only the matter after the last subdivision of {_describe(node, doc)} "
+                              f"can become a new {node.kind} after it.", doc, node)
+        hits = self._find(inst, old, windows, doc, node)
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{old}” {problem} in the matter following the subdivisions of "
+                              f"{_describe(node, doc)}.", doc, node)
+        match = hits[0][1]
+        text.strike(match.start(), match.end(), inst.cite)
+        if lead:
+            text.insert(match.start(), lead, (inst.cite,))
+        rest = text.cut(match.start() + len(lead))
+        last = blocks[-1]
+        while last.children:
+            last = last.children[-1]
+        last.body.segments += rest.segments
+        position = parent.children.index(node) + 1
+        parent.children[position:position] = blocks
+        self._check_duplicates(inst, doc, parent)
 
     def _edit_sentence(self, inst, doc, node) -> bool:
         """'By striking the second sentence', 'by inserting after the first sentence the following: "…"'."""

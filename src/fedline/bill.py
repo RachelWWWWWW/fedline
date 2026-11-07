@@ -181,6 +181,7 @@ def _parse_target(match: re.Match) -> Target | None:
 
 
 _LEVEL_WORDS = {f"{word}s": word for word in LEVELS} | {word: word for word in LEVELS}
+_KINDS = "|".join(_LEVEL_WORDS)
 _AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|designated|added|amended)(?:[^()]|\([^()]*\))*\)")
 
 
@@ -266,6 +267,15 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
             heading = True
             text = text[match.end():]
             continue
+        match = re.match(
+            rf"^in each of ({_KINDS}) ((?:\(\w+\))+(?:(?:,? and |, | through )(?:\(\w+\))+)*)(?:, |—|$)", text)
+        if match:
+            alternatives = _each_paths(_LEVEL_WORDS[match.group(1)], match.group(2))
+            if alternatives is None:
+                return path, within, heading, text
+            path.append(("each", alternatives))
+            text = text[match.end():]
+            continue
         match = re.match(r"^in section (\w+)(?:, |—|$)", text)
         if match:
             path.append(("section", match.group(1)))
@@ -277,6 +287,20 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
             text = text[match.end():]
             continue
         return path, within, heading, text
+
+
+def _each_paths(kind: str, text: str) -> tuple | None:
+    """The places named by "in each of paragraphs (3), (4)(B), and (6) through (8)", as relative paths."""
+    paths: list[tuple] = []
+    for item in re.split(r",? and |, ", text):
+        if " through " in item:
+            values = _designators(item, kind)
+            if values is None:
+                return None
+            paths += [((kind, value),) for value in values]
+        else:
+            paths.append(tuple(_path_from(kind, item)))
+    return tuple(paths) if len(paths) > 1 else None
 
 
 def _path_from(kind: str, values: str) -> list[tuple[str, str]]:

@@ -241,6 +241,53 @@ class WholeSectionTests(unittest.TestCase):
         self.assertGreater(new.order, CodeTitle(self.CODE).document("4347").order)
 
 
+class EachOfTests(unittest.TestCase):
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s824p"><num value="824p">§ 824p.</num>'
+            '<paragraph><num value="1">(1)</num><content>The Secretary may act within 5 years.</content></paragraph>'
+            '<paragraph><num value="2">(2)</num><content>The Secretary shall report within 5 years.</content>'
+            '</paragraph><paragraph><num value="3">(3)</num><content>The Secretary shall publish it.</content>'
+            '</paragraph><sourceCredit>(June 10, 1920, ch. 285, pt. II, § 216.)</sourceCredit></section>'
+            '</main></uscDoc>').encode()
+
+    def run_bill(self, instruction):
+        bill = parse_sections(f"<section><enum>2.</enum><text>Section 216 of the Federal Power Act (16 U.S.C. 824p) "
+                              f"is amended, {instruction}</text></section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        doc = find_doc(outcome, "16 U.S.C. § 824p") if outcome.documents else None
+        return outcome, [marked(c.body) for c in doc.root.children] if doc else None
+
+    def test_parses_lists_ranges_and_deeper_places(self):
+        bill = parse_sections("<section><enum>2.</enum><text>Section 216 of the Federal Power Act (16 U.S.C. 824p) "
+                              "is amended, in each of paragraphs (1), (4)(B), and (6) through (8), by striking "
+                              "<quote>a</quote>.</text></section>")
+        self.assertEqual(bill.instructions[0].path, [("each", (
+            (("paragraph", "1"),), (("paragraph", "4"), ("subparagraph", "B")),
+            (("paragraph", "6"),), (("paragraph", "7"),), (("paragraph", "8"),)))])
+
+    def test_applies_in_every_place_named(self):
+        outcome, texts = self.run_bill("in each of paragraphs (1) and (2), by striking <quote>5 years</quote> and "
+                                       "inserting <quote>10 years</quote>.")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual(texts, ["The Secretary may act within [-5 years-][+10 years+].",
+                                 "The Secretary shall report within [-5 years-][+10 years+].",
+                                 "The Secretary shall publish it."])
+
+    def test_a_failure_in_one_place_changes_none(self):
+        outcome, texts = self.run_bill("in each of paragraphs (1) and (3), by striking <quote>5 years</quote> and "
+                                       "inserting <quote>10 years</quote>.")
+        self.assertEqual((outcome.applied, outcome.failed), (0, 1))
+        self.assertIsNone(texts)  # nothing changed, so the section isn't in the redline
+        self.assertIn("none were changed", outcome.flags[-1].message)
+
+    def test_near_misses_are_checked_only_where_the_replacement_reached(self):
+        outcome, texts = self.run_bill("in each of paragraphs (1) and (2), by striking <quote>Secretary</quote> "
+                                       "each place it appears and inserting <quote>Commission</quote>.")
+        self.assertEqual(texts[2], "The Secretary shall publish it.")
+        self.assertEqual([f.message for f in outcome.flags], [])
+
+
 class CreditTests(unittest.TestCase):
     def test_public_law(self):
         self.assertEqual(credit_origin("(Pub. L. 104–104, § 3, Feb. 8, 1996, 110 Stat. 56.)"),

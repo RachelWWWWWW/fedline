@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .bill import Bill, Instruction, Target
-from .statute import INS, Act, CodeTitle, Document, Node, Text, norm
+from .statute import INS, Act, CodeTitle, Document, Node, Segment, Text, norm
 
 
 @dataclass
@@ -121,11 +121,12 @@ class Engine:
         self.direct: dict[str, Document] = {}
         self.docs: dict[str, Document] = {}
         self.outcome = Outcome(release_points={n: t.release_point for n, t in titles.items()})
-        self.global_phrases: list[tuple[str, Document, str]] = []
+        self.global_phrases: list[tuple[str, Document, Node, str]] = []
         self.duplicates: set[tuple[int, tuple[str, str]]] = set()
         self.inline: set[tuple[int, str]] = set()
         self.units: dict[str, tuple[str, str] | None] = {}  # the part or title each new section was added to
         self.act_names: dict[str, tuple] = {}  # Act names found in this bill, to the Acts they cite
+        self.undo: dict[str, list] | None = None  # document states to restore if an "in each of" fails
 
     def run(self) -> Outcome:
         for problem in self.bill.problems:
@@ -205,6 +206,33 @@ class Engine:
         return self.docs.setdefault(doc.key, doc) if doc else None
 
     def _apply(self, inst: Instruction) -> bool:
+        """Apply an instruction. One aimed at several places ("in each of paragraphs (1) and (2)") applies to
+        all of them or, if any fails, to none."""
+        steps = [i for i, step in enumerate(inst.path) if step[0] == "each"]
+        if not steps:
+            return self._apply_one(inst)
+        if len(steps) > 1:
+            return self._not_redlined(inst, "more than one \"in each of\" in an instruction isn't supported")
+        i = steps[0]
+        marks = len(self.outcome.flags), len(self.outcome.unredlined), len(self.global_phrases)
+        self.undo = {}
+        try:
+            for alternative in inst.path[i][1]:
+                one = replace(inst, path=inst.path[:i] + list(alternative) + inst.path[i + 1:])
+                if not self._apply_one(one):
+                    raise _NotApplied(self.outcome.unredlined[-1].reason)
+            return True
+        except _NotApplied as err:
+            for state in self.undo.values():
+                _restore(state)
+            del self.outcome.flags[marks[0]:], self.outcome.unredlined[marks[1]:], self.global_phrases[marks[2]:]
+            if not str(err).startswith("Not applied:"):
+                return self._not_redlined(inst, f"{err} (in one of the places named; none were changed)")
+            raise _NotApplied(f"{err} This instruction names several places; none were changed.", err.doc, err.node)
+        finally:
+            self.undo = None
+
+    def _apply_one(self, inst: Instruction) -> bool:
         target = inst.target
         if target.is_note:
             return self._apply_note(inst)
@@ -261,6 +289,8 @@ class Engine:
         return self._apply_in_doc(inst, doc, doc.root, path)
 
     def _apply_in_doc(self, inst, doc, root, path) -> bool:
+        if self.undo is not None and doc.key not in self.undo:
+            self.undo[doc.key] = _snapshot(doc.root)
         node = self._walk(root, path, inst, doc)
         return self._operate(inst, doc, node)
 
@@ -432,8 +462,9 @@ class Engine:
         for text, match in reversed(hits):
             _swap(text, match.start(), match.end(), new, inst.cite)
         count = len(hits)
-        if not inst.heading:
-            self.global_phrases.append((old, doc, inst.cite))
+        if not inst.heading and not inst.within:
+            # Checked afterwards for near misses, within the provision the replacement covered.
+            self.global_phrases.append((old, doc, node, inst.cite))
         return count
 
     def _global_in_act(self, inst, act: Act) -> bool:
@@ -725,8 +756,8 @@ class Engine:
         """After all edits, report text that a global replacement may have been meant to reach."""
         seen_headings = set()
         spans: dict[int, list[tuple[int, int]]] = {}
-        for phrase, doc, cite in self.global_phrases:
-            for node in _walk_nodes(doc.root):
+        for phrase, doc, scope, cite in self.global_phrases:
+            for node in _walk_nodes(scope):
                 if node.deleted:
                     continue
                 heading = node.heading.current()
@@ -755,6 +786,20 @@ class _NotApplied(Exception):
         super().__init__(message)
         self.doc = doc
         self.node = node
+
+
+def _snapshot(root: Node) -> list:
+    """Everything an edit can change in a document's tree, to put back with _restore."""
+    copy = lambda text: [Segment(s.text, s.status, s.sources) for s in text.segments]
+    return [(n, list(n.children), n.deleted, n.value, [copy(t) for t in (n.label, n.heading, n.body, n.tail)])
+            for n in _walk_nodes(root)]
+
+
+def _restore(state: list) -> None:
+    for node, children, deleted, value, texts in state:
+        node.children, node.deleted, node.value = children, deleted, value
+        for text, segments in zip((node.label, node.heading, node.body, node.tail), texts):
+            text.segments = segments
 
 
 def _walk_nodes(node: Node):

@@ -12,11 +12,11 @@ from xml.sax.saxutils import escape
 
 from .bill import Bill
 from .engine import Flag, Outcome
-from .statute import DEL, INS, ORIG, Document, Node, Text
+from .statute import DEL, INS, MOVED, ORIG, Document, Node, Text
 
 W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ' \
        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
-GREEN, RED = "00803C", "C00000"
+GREEN, RED, PURPLE = "00803C", "C00000", "7030A0"
 _INDENT = {"section": 0, "subsection": 0, "paragraph": 1, "subparagraph": 2,
            "clause": 3, "subclause": 4, "item": 5, "subitem": 6, "subsubitem": 7}
 SCOPE_NOTE = ("This redline shows only the text that the bill directly changes. It doesn't detect other laws "
@@ -36,6 +36,8 @@ def _status_props(status: str) -> str:
         return f'<w:color w:val="{GREEN}"/><w:u w:val="single"/>'
     if status == DEL:
         return f'<w:strike/><w:color w:val="{RED}"/>'
+    if status == MOVED:
+        return f'<w:color w:val="{PURPLE}"/><w:u w:val="double"/>'
     return ""
 
 
@@ -190,7 +192,9 @@ class Writer:
         out.append(_para(_run(f"{o.applied} of {o.total} instructions applied. {len(blocking)} not applied or "
                               f"unverified, {len(notes)} to review.", "<w:b/>")))
         out.append(_para(_run("Key: ") + _run("added text", _status_props(INS)) + _run("; ") +
-                         _run("deleted text", _status_props(DEL)) + _run(". Unchanged text is black.")))
+                         _run("deleted text", _status_props(DEL)) + _run("; ") +
+                         _run("moved text", _status_props(MOVED)) +
+                         _run(", shown where the bill moves it. Unchanged text is black.")))
         out.append(_para(_run(SCOPE_NOTE)))
         if b.provisions:
             cites = ", ".join(p.cite.removeprefix("§ ") for p in b.provisions)

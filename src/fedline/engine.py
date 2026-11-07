@@ -931,41 +931,44 @@ class Engine:
             # their indentation.
             child.kind = new_kind
         self._check_duplicates(inst, doc, node)
-        if inst.args.get("reorder"):
-            order = self._out_of_order(node, new_kind)
-            if order:
-                self._flag(inst.cite, f"Applied in part: the {kind}s are redesignated, but the instruction also moves "
-                                      f"them into numerical order, which this redline doesn't show yet. They're "
-                                      f"shown in the Code's order: {order}. Check the order by hand.", True, doc, node)
+        if inst.args.get("reorder") and self._move_into_order(node, new_kind, inst.cite) is None:
+            raise _NotApplied(f"Not applied: the {new_kind}s of {_describe(node, doc)} can't be put in order by "
+                              "their designations.", doc, node)
         return True
 
     def _reorder(self, inst, doc, node) -> bool:
-        """'By moving the paragraphs so as to appear in numerical order'. Moved text isn't shown yet, so only
-        subdivisions already in order count as applied."""
-        kind = inst.args["kind"]
-        order = self._out_of_order(node, kind)
-        if order is None:
-            raise _NotApplied(f"Not applied: the {kind}s of {_describe(node, doc)} can't be put in order by their "
-                              "designations.", doc, node)
-        if order:
-            raise _NotApplied(f"Not applied: moving the {kind}s of {_describe(node, doc)} into numerical order "
-                              f"isn't shown yet. They're in this order: {order}.", doc, node)
+        """'By moving the paragraphs so as to appear in numerical order'."""
+        if self._move_into_order(node, inst.args["kind"], inst.cite) is None:
+            raise _NotApplied(f"Not applied: the {inst.args['kind']}s of {_describe(node, doc)} can't be put in "
+                              "order by their designations.", doc, node)
         return True
 
-    @staticmethod
-    def _out_of_order(node: Node, kind: str) -> str | None:
-        """The designations of node's subdivisions of kind, as "(8), (4), …", when they're out of numerical order;
-        "" when they're in order; None when the designations can't be ordered."""
-        values = [c.value for c in node.children if not c.deleted and c.kind == kind]
-        if all(v.isdigit() for v in values):
-            keys = [int(v) for v in values]
-        elif all(len(v) == 1 and v.isalpha() for v in values):
-            keys = [ord(v) for v in values]
-        elif all(v.lower() in _ROMANS for v in values):
-            keys = [_ROMANS.index(v.lower()) for v in values]
-        else:
+    def _move_into_order(self, node: Node, kind: str, source: str) -> bool | None:
+        """Put node's subdivisions of kind in numerical order, marking as moved the fewest original ones that
+        explain the new order. Returns whether any moved, or None if the designations can't be ordered."""
+        if self.undo is not None:
+            raise _NotApplied("Not applied: moving subdivisions in an instruction that names several places "
+                              "isn't supported.", None, node)
+        slots = [i for i, c in enumerate(node.children) if not c.deleted and c.kind == kind]
+        nodes = [node.children[i] for i in slots]
+        keys = _order_keys([n.value for n in nodes])
+        if keys is None:
             return None
-        return "" if keys == sorted(keys) else ", ".join(f"({v})" for v in values)
+        order = sorted(range(len(nodes)), key=lambda i: keys[i])
+        if order == list(range(len(nodes))):
+            return False
+        # The original subdivisions that stay put are the longest run already in order; the others moved.
+        # Subdivisions the bill adds are new text, not moved text.
+        originals = [i for i in range(len(nodes)) if nodes[i].before_text()]
+        staying = _longest_increasing([keys[i] for i in originals])
+        for position, i in enumerate(originals):
+            if position not in staying:
+                nodes[i].mark_moved(source)
+        if node.original_order is None:
+            node.original_order = list(node.children)
+        for slot, i in zip(slots, order):
+            node.children[slot] = nodes[i]
+        return True
 
     def _redesignate_sections(self, inst, act: Act) -> bool:
         old, new = inst.args["old"], inst.args["new"]
@@ -1143,6 +1146,26 @@ def _container_for(block: Node, existing: list[Node]) -> Node | None:
             found = node
         node = node.children[-1]
     return found
+
+
+def _order_keys(values: list[str]) -> list[int] | None:
+    """Sort keys for designations all in one style: numbers, single letters or roman numerals."""
+    if all(v.isdigit() for v in values):
+        return [int(v) for v in values]
+    if all(len(v) == 1 and v.isalpha() for v in values):
+        return [ord(v) for v in values]
+    if all(v.lower() in _ROMANS for v in values):
+        return [_ROMANS.index(v.lower()) for v in values]
+    return None
+
+
+def _longest_increasing(keys: list[int]) -> set[int]:
+    """Positions of a longest strictly increasing subsequence of keys."""
+    best: list[list[int]] = []
+    for i, key in enumerate(keys):
+        chain = max((b for j, b in enumerate(best) if keys[j] < key), key=len, default=[])
+        best.append(chain + [i])
+    return set(max(best, key=len, default=[]))
 
 
 def _describe(node: Node, doc: Document) -> str:

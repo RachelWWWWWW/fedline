@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from xml.etree import ElementTree as ET
 
 ORIG, DEL, INS = "orig", "del", "ins"
+# Original text the bill moves to a new place, as when it puts paragraphs in numerical order. It's both
+# original and current text, so it counts in before() and current() alike.
+MOVED = "moved"
 LEVELS = ("section", "subsection", "paragraph", "subparagraph", "clause", "subclause", "item", "subitem",
           "subsubitem")
 # Elements the Code uses for subdivisions. "level" is a generic one, used where the usual names don't fit.
@@ -72,7 +75,7 @@ class Text:
         carried: list[str] = []
         kept: list[Segment] = []
         for seg in self.segments[first:last]:
-            if seg.status == ORIG:
+            if seg.status in (ORIG, MOVED):
                 kept.append(Segment(seg.text, DEL, (source,)))
             elif seg.status == INS:
                 carried.extend(seg.sources)
@@ -114,6 +117,9 @@ class Node:
     children: list["Node"] = field(default_factory=list)
     tail: Text = field(default_factory=Text)
     deleted: bool = False
+    # The children in their order before the bill moved any, kept so the original text can still be read
+    # in order.
+    original_order: list["Node"] | None = field(default=None, compare=False, repr=False)
 
     def texts(self, headings: bool = True):
         """Yield this subtree's text blocks in reading order."""
@@ -163,10 +169,23 @@ class Node:
                 or self.tail.changed() or any(c.changed() for c in self.children))
 
     def before_text(self) -> str:
+        children = self.children
+        if self.original_order is not None:
+            known = {id(c) for c in self.original_order}
+            children = self.original_order + [c for c in self.children if id(c) not in known]
         parts = [self.label.before(), self.heading.before(), self.body.before()]
-        parts += [c.before_text() for c in self.children if c.before_text()]
+        parts += [c.before_text() for c in children if c.before_text()]
         parts.append(self.tail.before())
         return "".join(parts)
+
+    def mark_moved(self, source: str) -> None:
+        """Mark this provision's original text as moved by source, keeping the bill's other edits to it."""
+        for text in (self.label, self.heading, self.body, self.tail):
+            for seg in text.segments:
+                if seg.status == ORIG:
+                    seg.status, seg.sources = MOVED, (source,)
+        for child in self.children:
+            child.mark_moved(source)
 
 
 @dataclass

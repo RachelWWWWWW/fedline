@@ -14,7 +14,8 @@ from fedline.docx_writer import write_docx
 from fedline.bill import Instruction, Target
 from fedline.engine import Engine, _NotApplied, _code_wording, _sentences, _word_matches, apply_bill
 from fedline.sources import SourceError, parse_bill_url
-from fedline.statute import CodeTitle, DEL, INS, Node, Text, _strip_ws, credit_origin
+from fedline.verify import verify
+from fedline.statute import CodeTitle, DEL, INS, MOVED, Node, Text, _strip_ws, credit_origin
 
 FIXTURES = Path(__file__).parent / "fixtures"
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -29,7 +30,7 @@ def run_bill():
 def marked(text: Text) -> str:
     out = ""
     for seg in text.segments:
-        out += {"orig": seg.text, DEL: f"[-{seg.text}-]", INS: f"[+{seg.text}+]"}[seg.status]
+        out += {"orig": seg.text, DEL: f"[-{seg.text}-]", INS: f"[+{seg.text}+]", MOVED: f"[~{seg.text}~]"}[seg.status]
     return out
 
 
@@ -206,16 +207,33 @@ class RedesignateTests(unittest.TestCase):
         self.assertEqual([(c.kind, c.value) for c in root.children],
                          [("paragraph", "1"), ("paragraph", "2"), ("paragraph", "2A"), ("paragraph", "3")])
 
-    def test_moving_into_numerical_order_isnt_dropped(self):
+    def test_moving_into_numerical_order_marks_the_fewest_provisions_moved(self):
         bill, outcome, root = self.run_bill(
             "<text>by redesignating subsections (a) through (c) as paragraphs (3), (1), and (2), respectively, and "
             "indenting and moving the paragraphs so as to appear in numerical order.</text>")
         self.assertTrue(bill.instructions[0].args["reorder"])
-        self.assertEqual(outcome.applied, 1)
-        self.assertEqual([c.value for c in root.children], ["3", "1", "2"])  # the Code's order, with a flag
-        self.assertEqual([f.blocking for f in outcome.flags], [True])
-        self.assertIn("Applied in part", outcome.flags[0].message)
-        self.assertIn("(3), (1), (2)", outcome.flags[0].message)
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        self.assertEqual([c.value for c in root.children], ["1", "2", "3"])
+        # (1) and (2) were already in order; only (3), the former (a), moved.
+        self.assertEqual([any(seg.status == MOVED for seg in c.body.segments) for c in root.children],
+                         [False, False, True])
+        self.assertEqual(marked(root.children[2].label), "[-(a)-][+(3)+]")
+        self.assertEqual(root.before_text(), "§ 1001.In this chapter:(a)“Secretary” means the Secretary.(b)“lease” means a "
+                                                     "lease.(c)“byproduct” means a mineral.")
+        self.assertIn("Original text in the redline matches the source XML in every section.", verify(bill, outcome))
+
+    def test_moved_text_is_purple_and_double_underlined(self):
+        bill, outcome, _ = self.run_bill(
+            "<text>by redesignating subsections (a) and (b) as paragraphs (2) and (1), respectively, and moving the "
+            "paragraphs so as to appear in numerical order.</text>")
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "ih", verify(bill, outcome))
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        moved = '<w:rPr><w:color w:val="7030A0"/><w:u w:val="double"/></w:rPr><w:t xml:space="preserve">'
+        # Swapping two, the first stays and the second, (1), the former (b), is marked as moved before it.
+        self.assertIn(moved + "“lease” means a lease.</w:t>", document)
+        self.assertIn(moved + "moved text</w:t>", document)  # the key
 
     def test_moving_subdivisions_already_in_order_needs_no_flag(self):
         _, outcome, _ = self.run_bill(
@@ -224,11 +242,11 @@ class RedesignateTests(unittest.TestCase):
         self.assertEqual((outcome.applied, outcome.flags), (1, []))
 
     def test_a_separate_instruction_to_reorder(self):
-        _, outcome, _ = self.run_bill(
+        _, outcome, root = self.run_bill(
             "<text>by redesignating subsections (a) and (b) as subsections (b) and (a), respectively;</text>",
             "<text>by moving the subsections so as to appear in numerical order.</text>")
-        self.assertEqual((outcome.applied, outcome.failed), (1, 1))
-        self.assertIn("isn't shown yet. They're in this order: (b), (a), (c).", outcome.flags[-1].message)
+        self.assertEqual((outcome.applied, outcome.failed), (2, 0))
+        self.assertEqual([c.value for c in root.children], ["a", "b", "c"])
 
     def test_other_words_after_the_designations_arent_swallowed(self):
         bill, _, _ = self.run_bill("<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), "

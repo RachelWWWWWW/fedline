@@ -1280,6 +1280,27 @@ class DocxTests(unittest.TestCase):
         self.assertTrue(refs)
         self.assertEqual(refs, defined)
 
+    def test_the_cover_page_links_to_the_appendix(self):
+        links = [h for h in self.document.iter(f"{W}hyperlink") if h.get(f"{W}anchor")]
+        self.assertEqual(["".join(h.itertext()) for h in links], ["appendix"])
+        marks = {b.get(f"{W}name"): b for b in self.document.iter(f"{W}bookmarkStart")}
+        self.assertIn(links[0].get(f"{W}anchor"), marks)
+        heading = next(p for p in self.document.iter(f"{W}p") if marks[links[0].get(f"{W}anchor")] in list(p))
+        self.assertTrue("".join(heading.itertext()).startswith("Appendix: provisions that don't amend"))
+
+    def test_no_appendix_no_link(self):
+        bill = parse_sections("<section><enum>2.</enum><text>Section 201 of the Federal Power Act (16 U.S.C. 824) "
+                              "is amended by striking <quote>fair</quote> and inserting <quote>just</quote>."
+                              "</text></section>")
+        outcome = apply_bill(bill, {16: CodeTitle(ActNameTests.CODE)})
+        self.assertEqual(bill.provisions, [])
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "ih", verify(bill, outcome))
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        self.assertNotIn("w:anchor=", document)
+        self.assertNotIn("bookmarkStart", document)
+
     def test_repeat_citations_refer_back_to_the_first_note(self):
         texts = ["".join(f.itertext()) for f in self.footnotes]
         self.assertTrue(any("See supra note" in t for t in texts))

@@ -33,6 +33,15 @@ def _run(text: str, props: str = "") -> str:
     return f"<w:r>{f'<w:rPr>{props}</w:rPr>' if props else ''}{body}</w:r>"
 
 
+APPENDIX_BOOKMARK = "Appendix"
+
+
+def _internal_link(bookmark: str, text: str) -> str:
+    """A link to a bookmark in this document."""
+    return f'<w:hyperlink w:anchor="{bookmark}"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr>' \
+           f'<w:t xml:space="preserve">{escape(text)}</w:t></w:r></w:hyperlink>'
+
+
 def _status_props(status: str) -> str:
     if status == INS:
         return f'<w:color w:val="{GREEN}"/><w:u w:val="single"/>'
@@ -236,7 +245,7 @@ class Writer:
         if b.provisions:
             cites = ", ".join(p.cite.removeprefix("§ ") for p in b.provisions)
             out.append(_para(_run(f"This bill also has provisions that don't amend statutory text (§§ {cites}). "
-                                  "They are in the appendix.")))
+                                  "They are in the ") + _internal_link(APPENDIX_BOOKMARK, "appendix") + _run(".")))
         if any(d.basis == "note" for d in o.documents):
             out.append(_para(_run("Redlines marked as based on a Code note use the text printed in the Code's "
                                   "notes, which may be incomplete or out of date.")))
@@ -289,7 +298,9 @@ class Writer:
         return "".join(out)
 
     def _appendix(self) -> str:
-        out = [_para(_run("Appendix: provisions that don't amend statutory text"), "Heading1")]
+        heading = _run("Appendix: provisions that don't amend statutory text")
+        out = [_para(f'<w:bookmarkStart w:id="0" w:name="{APPENDIX_BOOKMARK}"/>{heading}<w:bookmarkEnd w:id="0"/>',
+                     "Heading1")]
         for provision in self.bill.provisions:
             out.append(_para(_run(f"{provision.cite}. {provision.header}", "<w:b/>"), keep=True))
             out.extend(_para(_run(line)) for line in provision.text.split("\n") if line)

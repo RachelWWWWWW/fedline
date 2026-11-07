@@ -14,17 +14,66 @@ python -m venv .venv
 
 Open a new terminal after setting the key.
 
-## Use
+## Using fedline
+
+### 1. Get the bill's link
+
+Find the bill on [Congress.gov](https://www.congress.gov) and open its **Text** tab. To redline a particular version, choose it from the version list; the link then ends with the version's code, such as `/text/is` for "Introduced in Senate". For example:
+
+- `https://www.congress.gov/bill/119th-congress/senate-bill/5653/text/is`: S. 5653 as introduced
+- `https://www.congress.gov/bill/119th-congress/house-bill/10453/text`: H.R. 10453, latest version
+
+Without a version, fedline uses the latest text version Congress.gov has. Bills and joint, concurrent and simple resolutions from either chamber are accepted. Links to the bill's XML file (`BILLS-119s5653is.xml`) aren't; use the matching page link instead.
+
+### 2. Run it
+
+From the `fedline` folder, in PowerShell:
 
 ```powershell
-.venv\Scripts\fedline https://www.congress.gov/bill/119th-congress/house-bill/10453/text
+.venv\Scripts\fedline https://www.congress.gov/bill/119th-congress/senate-bill/5653/text/is
 ```
 
-Pass the bill's page on Congress.gov, optionally with a version, such as `.../senate-bill/5653/text/is`. Links to the bill's XML file (`BILLS-119s5653is.xml`) aren't accepted; use the matching page link instead.
+fedline downloads the bill, then each title of the US Code the bill amends. Large titles, such as Title 42, take a while. The run ends with a count:
 
-The document is written to `output\`, for example `output\HR10453_119_ih.docx`. Use `--out` to choose another folder.
+```
+190 of 237 instructions applied; 48 not applied or unverified, 3 to review.
+Wrote output\S5653_119_is.docx
+```
 
-The run ends with a count, such as `179 of 236 instructions applied; 58 not applied or unverified, 5 to review.` Instructions that weren't applied, or whose result failed a check, are flagged in the document, and those not applied are also listed at the end. Items to review were applied, with a note on something worth checking, such as an apparent drafting problem in the bill.
+### 3. Open the document
+
+The redline is written to `output\`, named for the bill and version, such as `output\S5653_119_is.docx`. Running the same bill again replaces it. Use `--out` to write somewhere else:
+
+```powershell
+.venv\Scripts\fedline <link> --out C:\redlines
+```
+
+### 4. Read the redline
+
+The document has four parts:
+
+- **Cover page.** The bill, its link, the bill version, and the Code release point used as the baseline. Also the count, the key (added text is green and underlined, deleted text red and struck through), the verification checks that passed, and numbered lists of the flags under "Not applied or unverified" and "To review".
+- **One part per amended provision**, in Code order: a Code section, an Act's text reproduced in a Code note, or a new section the bill adds, which has no Code number yet. Each change has a footnote citing the bill provision that made it. Flags appear in place as `[Flag n, § …: …]`.
+- **Instructions not redlined.** Each instruction fedline couldn't apply, quoted from the bill, with the reason.
+- **Appendix.** The bill's provisions that don't amend statutory text, such as its short title, definitions and authorizations of appropriations.
+
+The redline shows only text the bill directly changes. It doesn't find other laws whose cross-references are affected.
+
+### 5. Check the results
+
+Start with the flags on the cover page:
+
+- **Not applied or unverified:** the change isn't shown, or it's shown but failed a check. For those not applied, the bill's text is quoted under "Instructions not redlined"; apply them by hand. They include instructions whose wording fedline doesn't recognize, and text the Code words differently from the Act.
+- **To review:** the change was applied, but something is worth checking, such as an apparent drafting problem in the bill, or a heading struck because the new text has none.
+
+When an instruction is ambiguous, such as a phrase that appears twice, fedline flags it rather than choosing.
+
+If the run stops with an error:
+
+- `CONGRESS_API_KEY isn't set`: set the key as described under Setup, then open a new terminal.
+- `That doesn't look like a bill URL`: use the bill's page link, as in step 1.
+- `Congress.gov has no bill …`: check the Congress, bill type and number in the link.
+- `PermissionError` when writing the document: it's open in Word. Close it and run again.
 
 ## Tests
 

@@ -63,7 +63,7 @@ The redline shows only text the bill directly changes. It doesn't find other law
 
 Start with the flags on the cover page:
 
-- **Not applied or unverified:** the change isn't shown, or it's shown but failed a check. For those not applied, the bill's text is quoted under "Instructions not redlined"; apply them by hand. They include instructions whose wording fedline doesn't recognize, and text the Code words differently from the Act.
+- **Not applied or unverified:** the change isn't shown, or it's shown but failed a check. For those not applied, the bill's text is quoted under "Instructions not redlined"; apply them by hand. They include instructions whose wording fedline doesn't recognize, and text the Code words differently from the Act in a way fedline doesn't allow for.
 - **To review:** the change was applied, but something is worth checking, such as an apparent drafting problem in the bill, or a heading struck because the new text has none.
 
 When an instruction is ambiguous, such as a phrase that appears twice, fedline flags it rather than choosing.
@@ -87,7 +87,7 @@ If the run stops with an error:
   - "in the first proviso"
   - moving text. Nothing is shown in the "moved" format yet.
 - An instruction that only changes indentation, such as "by indenting clauses (i) through (v) appropriately", is applied without marks, because the redline indents each provision by its level. It's flagged to review.
-- When the Code's editors changed the Act's wording, for example printing "subchapter II of this chapter" for the Act's "title II of this Act", the bill's quoted text isn't found in the Code. The instruction is flagged, not applied.
+- When the Code's editors changed the Act's wording, fedline looks for the usual changes: Code section numbers for the Act's ("section 1532(13) of this title" for "section 3(13) of this Act"), "this chapter" for "this Act", "subchapter II of this chapter" for "title II of this Act", a date for "the date of enactment of this section", bracketed citations, and curly apostrophes. A match found that way is applied only if it's the only one, and it's flagged to review. The new text is the bill's, so it may use the Act's numbering inside the Code's text. Other changes, such as reworded sentences, aren't found, and the instruction is flagged, not applied.
 - A law cited only by the Statutes at Large, with no Code citation, isn't found. Neither is a chapter's table of sections.
 - The Code's editorial footnotes are left out of the statutory text. Bracketed editorial notes printed in the text, such as "[Amended this section.]", are kept.
 - The 99.9% accuracy target hasn't been measured. That needs the test against enacted laws, which isn't built yet.

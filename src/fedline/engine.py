@@ -49,6 +49,95 @@ def _word_matches(phrase: str, text: str, ignore_case: bool = False) -> list[re.
     return list(re.finditer(rf"{before}{re.escape(phrase)}{after}", text, flags))
 
 
+# How the Code's editors reword an Act's text, as (pattern in the bill's phrase, builder of a pattern for the
+# Code's text). Each builder gets the match and the Act's section numbers mapped to Code sections, and whether
+# the match ends the phrase, and returns a regex that accepts both wordings.
+_DATE = r"[A-Z][a-z]+\.? \d{1,2}, \d{4}"
+_PARTS_RE = r"(?:\(\w+\))*"
+
+
+def _either(*alternatives: str) -> str:
+    return "(?:" + "|".join(dict.fromkeys(alternatives)) + ")"
+
+
+def _number(value: str, numbers: dict[str, str]) -> str:
+    return _either(re.escape(value), re.escape(numbers[value])) if value in numbers else re.escape(value)
+
+
+def _cite_ref(m, numbers, at_end):
+    """"section 216(a) of the Federal Power Act (16 U.S.C. 824p(a))": the Code may print "section 824p(a) of
+    title 16", or keep the name and bracket the citation."""
+    cite = rf"[(\[]?{m['title']} U\.S\.C\. {re.escape(m['usc'])}[)\]]?"
+    named = rf"section {re.escape(m['sec'])} of {re.escape(m['act'])} {cite}"
+    return _either(named, rf"section {re.escape(m['usc'])} of title {m['title']}")
+
+
+def _section_ref(m, numbers, at_end):
+    """"section 3(13) of this Act", "section 2(c) herein", "section 304(l)": the Code prints its own
+    section number, followed by "of this title"."""
+    if m["num"] not in numbers:
+        return None
+    reference = rf"section {_number(m['num'], numbers)}{re.escape(m['parts'])}"
+    if m["suffix"]:
+        return reference + r"(?: of this (?:Act|title|chapter)| herein)"
+    # The Code may add "of this title" where the Act has nothing, but not at the end of the phrase, where
+    # striking it would leave the new text without it.
+    return reference if at_end else reference + "(?: of this title)?"
+
+
+def _bare_number(m, numbers, at_end):
+    """An Act section in a list, as in "212, 215, and 222" or "section 402, and (G)". The Code puts "of this
+    title" after the last number of a list, which may fall inside the phrase."""
+    if m["num"] not in numbers:
+        return None
+    return _number(m["num"], numbers) + re.escape(m["parts"]) + ("" if at_end else "(?: of this title)?")
+
+
+_CODE_WORDING = [
+    (re.compile(r"section (?P<sec>\w+" + _PARTS_RE + r") of (?P<act>(?:the )?[A-Z][^()]*? Act(?: of \d{4})?) "
+                r"\(?(?P<title>\d+) U\.S\.C\. (?P<usc>\w+" + _PARTS_RE + r")\)?"), _cite_ref),
+    (re.compile(r"\(?(?P<title>\d+) U\.S\.C\. (?P<usc>\w+" + _PARTS_RE + r")\)?"),
+     lambda m, n, e: rf"[(\[]?{m['title']} U\.S\.C\. {re.escape(m['usc'])}[)\]]?"),
+    (re.compile(r"the date of (?:the )?enactment of this (?:Act|section|subsection|paragraph|title)"),
+     lambda m, n, e: _either(re.escape(m[0]), _DATE)),
+    (re.compile(r"(?P<unit>title|subtitle|part|chapter) (?P<num>\w+) of this Act"),
+     lambda m, n, e: _either(re.escape(m[0]), rf"(?:subchapter|part|chapter|subtitle) {re.escape(m['num'])} "
+                                               r"of this (?:chapter|subchapter|title)")),
+    (re.compile(r"this Act\b"), lambda m, n, e: r"this (?:Act|chapter|subchapter|title)"),
+    (re.compile(r"section (?P<num>\d+[A-Za-z]?(?:–\d+)?)(?P<parts>" + _PARTS_RE + r")"
+                r"(?P<suffix> of this Act| herein)?"), _section_ref),
+    (re.compile(r"(?<![\w(–-])(?P<num>\d+[A-Za-z]?(?:–\d+)?)(?P<parts>" + _PARTS_RE + r")(?![\w–-])"), _bare_number),
+    (re.compile(r"['’]"), lambda m, n, e: "['’]"),
+    (re.compile(r"[\"“”]"), lambda m, n, e: "[\"“”]"),
+]
+
+
+def _code_wording(phrase: str, numbers: dict[str, str]) -> str | None:
+    """A regex accepting the phrase as the Code's editors may print it, or None when there's no rewording
+    to allow for."""
+    out, pos, changed = [], 0, False
+    while pos < len(phrase):
+        for pattern, build in _CODE_WORDING:
+            match = pattern.match(phrase, pos)
+            if not match or not match.group(0):
+                continue
+            piece = build(match, numbers, match.end() == len(phrase))
+            if piece is None:
+                continue
+            out.append(piece)
+            changed = changed or piece != re.escape(match.group(0))
+            pos = match.end()
+            break
+        else:
+            out.append(re.escape(phrase[pos]))
+            pos += 1
+    if not changed:
+        return None
+    before = r"(?<!\w)" if phrase[:1].isalnum() else ""
+    after = r"(?!\w)" if phrase[-1:].isalnum() else ""
+    return before + "".join(out) + after
+
+
 _UNIT_ABBREVIATIONS = {"part": r"pt\.", "title": "title", "subtitle": "subtitle"}
 
 
@@ -128,6 +217,8 @@ class Engine:
         self.units: dict[str, tuple[str, str] | None] = {}  # the part or title each new section was added to
         self.act_names: dict[str, tuple] = {}  # Act names found in this bill, to the Acts they cite
         self.undo: dict[str, list] | None = None  # document states to restore if an "in each of" fails
+        # Notes that the Code's wording was matched, kept until the instruction applies.
+        self.reworded: list[tuple] = []
 
     def run(self) -> Outcome:
         for problem in self.bill.problems:
@@ -135,11 +226,17 @@ class Engine:
             self.outcome.unredlined.append(Unredlined(problem.cite, problem.raw, problem.reason))
             self._flag(problem.cite, f"Not applied: {problem.reason}. See the list of instructions not redlined.")
         for instruction in self.bill.instructions:
+            self.reworded = []
             try:
                 ok = self._apply(instruction)
             except _NotApplied as err:
                 self._flag(instruction.cite, str(err), doc=err.doc, node=err.node)
                 ok = False
+            if ok:
+                notes = {(message, id(doc), id(node)): (message, blocking, doc, node)
+                         for message, blocking, doc, node in self.reworded}
+                for note in notes.values():
+                    self._flag(instruction.cite, *note)
             if ok:
                 self.outcome.applied += 1
             else:
@@ -456,9 +553,41 @@ class Engine:
         return [(text, m) for text, start, end in windows for m in _word_matches(phrase, text.current(), ignore_case)
                 if start <= m.start() and m.end() <= end]
 
+    def _find(self, inst, phrase, windows, doc, node, ignore_case=False) -> list[tuple[Text, re.Match]]:
+        """Matches of the bill's phrase. When there are none, the phrase as the Code's editors may have
+        printed it, as in "section 1532(13) of this title" for the Act's "section 3(13) of this Act", if
+        that matches exactly once. The match is then noted for review."""
+        hits = self._hits(phrase, windows, ignore_case)
+        if hits:
+            return hits
+        pattern = _code_wording(phrase, self._numbers(inst))
+        if pattern is None:
+            return []
+        flags = re.IGNORECASE if ignore_case else 0
+        hits = [(text, m) for text, start, end in windows for m in re.finditer(pattern, text.current(), flags)
+                if start <= m.start() and m.end() <= end]
+        if len(hits) == 1:
+            self.reworded.append((f"The Code prints “{hits[0][1].group(0)}” where the bill quotes the Act's "
+                                  f"“{phrase}”. Applied to the Code's wording; any new text is the bill's, as "
+                                  "worded for the Act. Check the match.", False, doc, node))
+            return hits
+        return []
+
+    def _numbers(self, inst) -> dict[str, str]:
+        """The Act's section numbers mapped to their Code sections, for an instruction amending an Act."""
+        target = inst.target
+        if target.is_note or target.chapter or target.name.startswith("title "):
+            return {}
+        act = self._act(target)
+        if act is None:
+            return {}
+        codes = {number: doc.key.split("usc", 1)[1] for number, doc in act.sections.items()
+                 if doc.basis == "code" and "usc" in doc.key}  # not the sections the bill adds
+        return {number: code for number, code in codes.items() if code != number}
+
     def _replace_once(self, inst, doc, node) -> bool:
         old, new = inst.args["old"], inst.args["new"]
-        hits = self._hits(old, self._scope(inst, doc, node), inst.heading)
+        hits = self._find(inst, old, self._scope(inst, doc, node), doc, node, inst.heading)
         if not hits:
             raise _NotApplied(f"Not applied: “{old}” wasn't found in {_describe(node, doc)}. "
                               "The Code's wording may differ from the Act's.", doc, node)
@@ -466,7 +595,7 @@ class Engine:
             raise _NotApplied(f"Not applied: “{old}” appears {len(hits)} times in {_describe(node, doc)}, "
                               "and the instruction doesn't say which one.", doc, node)
         text, match = hits[0]
-        if match.group(0) != old:
+        if match.group(0) != old and match.group(0).lower() == old.lower():
             self._flag(inst.cite, f"The text “{match.group(0)}” differs in capitalization from the bill's "
                                   f"“{old}”. Applied, using the bill's capitalization for the new text.",
                        False, doc, node)
@@ -576,7 +705,7 @@ class Engine:
         """'By striking "A" and all that follows through "B"', within one block of text."""
         start, end, new = inst.args["start"], inst.args["end"], inst.args["new"]
         windows = self._scope(inst, doc, node)
-        hits = self._hits(start, windows)
+        hits = self._find(inst, start, windows, doc, node)
         if len(hits) != 1:
             problem = "wasn't found" if not hits else f"appears {len(hits)} times"
             raise _NotApplied(f"Not applied: “{start}” {problem} in {_describe(node, doc)}.", doc, node)
@@ -584,11 +713,11 @@ class Engine:
         limit = next(e for t, s, e in windows if t is text and s <= match.start() and match.end() <= e)
         current = text.current()
         if end is not None:
-            ends = _word_matches(end, current[match.end():limit])
+            ends = [m for _, m in self._find(inst, end, [(text, match.end(), limit)], doc, node)]
             if not ends:
                 raise _NotApplied(f"Not applied: “{end}” wasn't found after “{start}” in the same block of text "
                                   f"in {_describe(node, doc)}.", doc, node)
-            stop = match.end() + ends[0].end()
+            stop = ends[0].end()
         else:
             # "The period at the end" is the end of the window: a sentence, if the instruction names one.
             punct = inst.args["end_punct"]
@@ -715,7 +844,7 @@ class Engine:
                               doc, node)
         text = node.body
         windows = [w for w in self._scope(inst, doc, node) if w[0] is text]
-        hits = self._hits(old, windows)
+        hits = self._find(inst, old, windows, doc, node)
         if at_start:
             hits = [(t, m) for t, m in hits if m.start() == 0]
         if len(hits) != 1:
@@ -762,7 +891,7 @@ class Engine:
 
     def _insert_text(self, inst, doc, node) -> bool:
         anchor, new = inst.args["anchor"], inst.args["new"]
-        hits = self._hits(anchor, self._scope(inst, doc, node))
+        hits = self._find(inst, anchor, self._scope(inst, doc, node), doc, node)
         if len(hits) != 1:
             problem = "wasn't found" if not hits else f"appears {len(hits)} times"
             raise _NotApplied(f"Not applied: the anchor “{anchor}” {problem} in {_describe(node, doc)}.", doc, node)

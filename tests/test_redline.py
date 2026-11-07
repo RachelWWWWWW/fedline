@@ -12,7 +12,7 @@ from fedline.bill import _designators, parse_bill
 from fedline.cli import redline
 from fedline.docx_writer import write_docx
 from fedline.bill import Instruction, Target
-from fedline.engine import Engine, _NotApplied, _sentences, _word_matches, apply_bill
+from fedline.engine import Engine, _NotApplied, _code_wording, _sentences, _word_matches, apply_bill
 from fedline.sources import SourceError, parse_bill_url
 from fedline.statute import CodeTitle, DEL, INS, Node, Text, _strip_ws, credit_origin
 
@@ -175,6 +175,73 @@ class ActNameTests(unittest.TestCase):
                          "The [-rate-][+charge+] is [-fair-][+just+].")
         new = find_doc(outcome, "New § 203 of the Federal Power Act (no Code section number yet)")
         self.assertGreater(new.order, find_doc(outcome, "16 U.S.C. § 824").order)
+
+
+class CodeWordingTests(unittest.TestCase):
+    """The Code's editors reword an Act's text: its own section numbers for the Act's, "this chapter" for
+    "this Act", dates for "the date of enactment", curly apostrophes. A phrase quoted from the Act is matched
+    against those forms when it isn't found as is."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s1532"><num value="1532">§ 1532.</num><content>Definitions.</content>'
+            '<sourceCredit>(Pub. L. 93–205, § 3, Dec. 28, 1973.)</sourceCredit></section>'
+            '<section identifier="/us/usc/t16/s1536"><num value="1536">§ 1536.</num><content>Any person, as defined '
+            'by section 1532(13) of this title, may obtain review under sections 1532 and 1533 of this title. '
+            'The agency’s rules are due 18 months after December 28, 1973. The agency’s staff shall assist.'
+            '</content><sourceCredit>(Pub. L. 93–205, § 7, Dec. 28, 1973.)</sourceCredit></section>'
+            '<section identifier="/us/usc/t16/s1533"><num value="1533">§ 1533.</num><content>Listing.</content>'
+            '<sourceCredit>(Pub. L. 93–205, § 4, Dec. 28, 1973.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum><text>{text}</text></paragraph>"
+                        for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>Section 7 of the Endangered Species Act of 1973 "
+                              f"(16 U.S.C. 1536) is amended—</text>{items}</section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        docs = [d for d in outcome.documents if d.title == "16 U.S.C. § 1536"]
+        return outcome, marked(docs[0].root.body) if docs else None
+
+    def test_patterns_allow_the_codes_forms_and_leave_plain_phrases_alone(self):
+        self.assertIsNone(_code_wording("may obtain review", {"3": "1532"}))
+        pattern = _code_wording("section 3(13) of this Act,", {"3": "1532"})
+        self.assertRegex("section 1532(13) of this title,", pattern)
+        self.assertRegex("section 3(13) of this Act,", pattern)
+        self.assertRegex("subchapter II of this chapter", _code_wording("title II of this Act", {}))
+        self.assertRegex("1342 of this title, and (G)", _code_wording("402, and (G)", {"402": "1342"}))
+        # At the end of a phrase, "of this title" isn't taken, so striking the phrase leaves it in place.
+        self.assertNotRegex("and 824v of this title", _code_wording("and 222", {"222": "824v"}) + "$")
+        self.assertRegex("the Federal Power Act [16 U.S.C. 824p(a)]",
+                         _code_wording("the Federal Power Act (16 U.S.C. 824p(a))", {}))
+        self.assertRegex("section 824p(a) of title 16",
+                         _code_wording("section 216(a) of the Federal Power Act (16 U.S.C. 824p(a))", {}))
+
+    def test_the_codes_wording_is_matched_and_noted_for_review(self):
+        outcome, body = self.run_bill(
+            "by striking <quote>Any person, as defined by section 3(13) of this Act,</quote> and inserting "
+            "<quote>Any person</quote>;",
+            "by striking <quote>sections 3 and 4</quote> and inserting <quote>sections 3, 4, and 5</quote>;",
+            "by striking <quote>18 months after the date of enactment of this section</quote> and inserting "
+            "<quote>1 year after the date of enactment of the Recovery Act</quote>.")
+        self.assertEqual((outcome.applied, outcome.failed), (3, 0))
+        self.assertEqual(body, "[-Any person, as defined by section 1532(13) of this title,-][+Any person+] may "
+                               "obtain review under [-sections 1532 and 1533-][+sections 3, 4, and 5+] of this "
+                               "title. The agency’s rules are due [-18 months after December 28, 1973-][+1 year "
+                               "after the date of enactment of the Recovery Act+]. The agency’s staff shall assist.")
+        self.assertEqual([f.blocking for f in outcome.flags], [False, False, False])
+        self.assertIn("The Code prints “sections 1532 and 1533” where the bill quotes the Act's “sections 3 and 4”",
+                      outcome.flags[1].message)
+
+    def test_a_reworded_match_that_isnt_unique_isnt_applied(self):
+        outcome, body = self.run_bill("by striking <quote>agency's</quote> and inserting <quote>agency</quote>.")
+        self.assertEqual((outcome.applied, outcome.failed), (0, 1))
+        self.assertIsNone(body)
+        self.assertIn("wasn't found", outcome.flags[0].message)
+
+    def test_a_review_note_is_dropped_when_the_instruction_then_fails(self):
+        outcome, _ = self.run_bill("by striking <quote>section 3(13) of this Act</quote> and all that follows "
+                                   "through <quote>nowhere</quote> and inserting <quote>X</quote>.")
+        self.assertEqual(outcome.applied, 0)
+        self.assertEqual([f.blocking for f in outcome.flags], [True])
 
 
 class LeadInTests(unittest.TestCase):

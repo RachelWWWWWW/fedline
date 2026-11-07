@@ -12,11 +12,13 @@ from xml.sax.saxutils import escape
 
 from .bill import Bill
 from .engine import Flag, Outcome
-from .statute import DEL, INS, ORIG, Document, Node, Text
+from .statute import DEL, INS, MOVED, ORIG, Document, Node, Text
 
 W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ' \
        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
-GREEN, RED = "00803C", "C00000"
+GREEN, RED, PURPLE = "00803C", "C00000", "7030A0"
+# The old place of moved text. It's only in the document, not a status of the statute's text.
+MOVED_FROM = "moved_from"
 _INDENT = {"section": 0, "subsection": 0, "paragraph": 1, "subparagraph": 2,
            "clause": 3, "subclause": 4, "item": 5, "subitem": 6, "subsubitem": 7}
 SCOPE_NOTE = ("This redline shows only the text that the bill directly changes. It doesn't detect other laws "
@@ -31,11 +33,24 @@ def _run(text: str, props: str = "") -> str:
     return f"<w:r>{f'<w:rPr>{props}</w:rPr>' if props else ''}{body}</w:r>"
 
 
+APPENDIX_BOOKMARK = "Appendix"
+
+
+def _internal_link(bookmark: str, text: str) -> str:
+    """A link to a bookmark in this document."""
+    return f'<w:hyperlink w:anchor="{bookmark}"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr>' \
+           f'<w:t xml:space="preserve">{escape(text)}</w:t></w:r></w:hyperlink>'
+
+
 def _status_props(status: str) -> str:
     if status == INS:
         return f'<w:color w:val="{GREEN}"/><w:u w:val="single"/>'
     if status == DEL:
         return f'<w:strike/><w:color w:val="{RED}"/>'
+    if status == MOVED:
+        return f'<w:color w:val="{PURPLE}"/><w:u w:val="double"/>'
+    if status == MOVED_FROM:
+        return f'<w:dstrike/><w:color w:val="{PURPLE}"/>'
     return ""
 
 
@@ -115,7 +130,21 @@ class Writer:
         if pieces:
             lines.append(_Line(pieces, indent))
         lines.extend(_Line(flag=f) for f in flags.get(id(node), []))
-        for child in node.children:
+        for child, ghost in _display_order(node):
+            if ghost:
+                self._ghost_lines(child, lines, indent, child.moved_by)
+                continue
+            if child.run_in and lines and lines[-1].flag is None and lines[-1].pieces:
+                # Its designation is struck, and its text finishes the sentence before it.
+                before = len(lines)
+                self._lines(child, flags, lines, parent_indent=indent)
+                own, lines[before:] = lines[before:], []
+                for line in own:
+                    if line.flag is None and line.pieces:
+                        lines[before - 1].pieces += [_Piece(" ", ORIG, (), False)] + line.pieces
+                    else:
+                        lines.append(line)
+                continue
             if child.kind == "continuation":
                 # Text between subdivisions lines up with the text that introduced them.
                 text = self._pieces(child.body)
@@ -126,6 +155,36 @@ class Writer:
         tail = self._pieces(node.tail)
         if tail:
             lines.append(_Line(tail, indent))
+
+    def _ghost_lines(self, node: Node, lines: list[_Line], parent_indent: int, source: str) -> None:
+        """A moved provision at its old place: its text as it stood before the bill, struck through in purple."""
+        indent = _INDENT.get(node.original_kind or node.kind, parent_indent + 1)
+        pieces: list[_Piece] = []
+        for part, bold in ((node.label, True), (node.heading, True), (node.body, False)):
+            text = part.before()
+            if text:
+                if pieces:
+                    pieces.append(_Piece(" ", ORIG, (), False))
+                pieces.append(_Piece(text, MOVED_FROM, (source,), bold))
+        line = _Line(pieces, indent)
+        lines.append(line)
+        for child in node.original_order if node.original_order is not None else node.children:
+            if not child.before_text():
+                continue
+            if child.kind == "continuation":
+                line = _Line([_Piece(child.body.before(), MOVED_FROM, (source,))], indent)
+                lines.append(line)
+            elif not child.label.before():
+                # Original text the bill moved into a provision it added, as when it splits a paragraph into
+                # subparagraphs: where it was, it ran on in this provision's text.
+                line.pieces.append(_Piece(child.before_text(), MOVED_FROM, (source,)))
+            else:
+                self._ghost_lines(child, lines, indent, source)
+                line = _Line([], indent)
+                lines.append(line)
+        if node.tail.before():
+            line.pieces.append(_Piece(node.tail.before(), MOVED_FROM, (source,)))
+        lines[:] = [l for l in lines if l.flag is not None or l.pieces]
 
     def _render_lines(self, lines: list[_Line]) -> str:
         """Render lines, with one footnote per run of adjacent changes from the same provisions."""
@@ -190,12 +249,14 @@ class Writer:
         out.append(_para(_run(f"{o.applied} of {o.total} instructions applied. {len(blocking)} not applied or "
                               f"unverified, {len(notes)} to review.", "<w:b/>")))
         out.append(_para(_run("Key: ") + _run("added text", _status_props(INS)) + _run("; ") +
-                         _run("deleted text", _status_props(DEL)) + _run(". Unchanged text is black.")))
+                         _run("deleted text", _status_props(DEL)) + _run("; ") +
+                         _run("moved text", _status_props(MOVED)) + _run(" where the bill moves it, and ") +
+                         _run("where it was", _status_props(MOVED_FROM)) + _run(". Unchanged text is black.")))
         out.append(_para(_run(SCOPE_NOTE)))
         if b.provisions:
             cites = ", ".join(p.cite.removeprefix("§ ") for p in b.provisions)
             out.append(_para(_run(f"This bill also has provisions that don't amend statutory text (§§ {cites}). "
-                                  "They are in the appendix.")))
+                                  "They are in the ") + _internal_link(APPENDIX_BOOKMARK, "appendix") + _run(".")))
         if any(d.basis == "note" for d in o.documents):
             out.append(_para(_run("Redlines marked as based on a Code note use the text printed in the Code's "
                                   "notes, which may be incomplete or out of date.")))
@@ -248,7 +309,9 @@ class Writer:
         return "".join(out)
 
     def _appendix(self) -> str:
-        out = [_para(_run("Appendix: provisions that don't amend statutory text"), "Heading1")]
+        heading = _run("Appendix: provisions that don't amend statutory text")
+        out = [_para(f'<w:bookmarkStart w:id="0" w:name="{APPENDIX_BOOKMARK}"/>{heading}<w:bookmarkEnd w:id="0"/>',
+                     "Heading1")]
         for provision in self.bill.provisions:
             out.append(_para(_run(f"{provision.cite}. {provision.header}", "<w:b/>"), keep=True))
             out.extend(_para(_run(line)) for line in provision.text.split("\n") if line)
@@ -269,6 +332,23 @@ class Writer:
         if self.bill.provisions:
             blocks.append(self._appendix())
         return _SECTION_BREAK.join(blocks) + _PAGE_SETUP
+
+
+def _display_order(node: Node) -> list[tuple[Node, bool]]:
+    """node's children in order, each with whether it's the old place of a moved one. Old places go just
+    before the first child that didn't move and followed them in the original order."""
+    if node.original_order is None:
+        return [(c, False) for c in node.children]
+    original = {id(c): i for i, c in enumerate(node.original_order)}
+    ghosts = [c for c in node.original_order if c.moved_by]
+    out: list[tuple[Node, bool]] = []
+    for child in node.children:
+        if id(child) in original and not child.moved_by:
+            while ghosts and original[id(ghosts[0])] < original[id(child)]:
+                out.append((ghosts.pop(0), True))
+        out.append((child, False))
+    out.extend((g, True) for g in ghosts)
+    return out
 
 
 _PAGE_SETUP = '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>' \

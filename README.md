@@ -52,7 +52,7 @@ The redline is written to `output\`, named for the bill and version, such as `ou
 
 The document has four parts:
 
-- **Cover page.** The bill, its link, the bill version, and the Code release point used as the baseline. Also the count, the key (added text is green and underlined, deleted text red and struck through), the verification checks that passed, and numbered lists of the flags under "Not applied or unverified" and "To review".
+- **Cover page.** The bill, its link, the bill version, and the Code release point used as the baseline. Also the count, the key (added text is green and underlined, deleted text red and struck through, moved text purple and double-underlined where it goes and purple and double-struck where it was), the verification checks that passed, and numbered lists of the flags under "Not applied or unverified" and "To review".
 - **One part per amended provision**, in Code order: a Code section, an Act's text reproduced in a Code note, or a new section the bill adds, which has no Code number yet. Each change has a footnote citing the bill provision that made it. Flags appear in place as `[Flag n, § …: …]`.
 - **Instructions not redlined.** Each instruction fedline couldn't apply, quoted from the bill, with the reason.
 - **Appendix.** The bill's provisions that don't amend statutory text, such as its short title, definitions and authorizations of appropriations.
@@ -63,7 +63,7 @@ The redline shows only text the bill directly changes. It doesn't find other law
 
 Start with the flags on the cover page:
 
-- **Not applied or unverified:** the change isn't shown, or it's shown but failed a check. For those not applied, the bill's text is quoted under "Instructions not redlined"; apply them by hand. They include instructions whose wording fedline doesn't recognize, and text the Code words differently from the Act.
+- **Not applied or unverified:** the change isn't shown, or it's shown but failed a check. For those not applied, the bill's text is quoted under "Instructions not redlined"; apply them by hand. They include instructions whose wording fedline doesn't recognize, and text the Code words differently from the Act in a way fedline doesn't allow for.
 - **To review:** the change was applied, but something is worth checking, such as an apparent drafting problem in the bill, or a heading struck because the new text has none.
 
 When an instruction is ambiguous, such as a phrase that appears twice, fedline flags it rather than choosing.
@@ -84,9 +84,11 @@ If the run stops with an error:
 ## Current limits
 
 - Instructions are parsed by pattern matching. Wording the parser doesn't recognize is flagged and listed, not applied. The LLM step for harder wording isn't built yet. Wording not yet recognized includes:
-  - "in the first proviso"
-  - indenting, and moving text. Nothing is shown in the "moved" format yet.
-- When the Code's editors changed the Act's wording, for example printing "subchapter II of this chapter" for the Act's "title II of this Act", the bill's quoted text isn't found in the Code. The instruction is flagged, not applied.
-- A law cited only by the Statutes at Large, with no Code citation, isn't found. Neither is a chapter's table of sections.
+  - moving text, other than putting subdivisions in numerical order.
+- When the bill adds a section whose number the law already uses, as S. 5653 § 2234 adds a § 37 to the Federal Power Act, the new section is added under the next whole number not in use, and flagged to review. References elsewhere to the number the bill gave it aren't changed. A taken number that isn't a whole number, such as 216A, stays flagged as not applied or unverified.
+- Moved text is shown twice: where the bill moves it, purple and double-underlined, and where it was, purple and double-struck, with its old designation. When subdivisions are put in numerical order, only the fewest needed to explain the new order are marked as moved.
+- An instruction that only changes indentation, such as "by indenting clauses (i) through (v) appropriately", is applied without marks, because the redline indents each provision by its level. It's flagged to review.
+- When the Code's editors changed the Act's wording, fedline looks for the usual changes: Code section numbers for the Act's ("section 1532(13) of this title" for "section 3(13) of this Act"), "this chapter" for "this Act", "subchapter II of this chapter" for "title II of this Act", a date for "the date of enactment of this section", bracketed citations, including ones the Code adds after a law it names ("as amended [25 U.S.C. 5101 et seq.]"), no enacting "That" at the start of a section, no "hereby", and curly apostrophes. A match found that way is applied only if it's the only one, and it's flagged to review. The new text is the bill's, so it may use the Act's numbering inside the Code's text. Other changes, such as reworded sentences, aren't found, and the instruction is flagged, not applied.
+- A law cited only by the Statutes at Large is found only through the Code citations its instructions give, as in "in section 2 (62 Stat. 18, chapter 45; 25 U.S.C. 324)". Without them it isn't found. Nor is a chapter's table of sections.
 - The Code's editorial footnotes are left out of the statutory text. Bracketed editorial notes printed in the text, such as "[Amended this section.]", are kept.
 - The 99.9% accuracy target hasn't been measured. That needs the test against enacted laws, which isn't built yet.

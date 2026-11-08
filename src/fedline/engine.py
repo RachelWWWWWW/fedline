@@ -529,7 +529,11 @@ class Engine:
         windows = [(t, 0, len(t.current())) for t in node.texts(headings=False) if t.current()]
         for part in inst.within:
             if part[0] == "sentence":
-                windows = [self._sentence(self._sentence_base(windows, part[1], doc, node), part[1], doc, node)]
+                base = self._sentence_base(windows, part[1], doc, node)
+                try:
+                    windows = [self._sentence(base, part[1], doc, node)]
+                except _NotApplied:
+                    windows = [self._sentence_by_text(inst, base, part[1], doc, node)]
                 continue
             if part[0] == "proviso":
                 windows = [self._proviso(windows, part[1], doc, node)]
@@ -582,6 +586,24 @@ class Engine:
             raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't have a {_ordinal(n)} sentence "
                               f"(it has {len(spans)}).", doc, node)
         return (text, *spans[n - 1 if n > 0 else -1])
+
+    def _sentence_by_text(self, inst, window, n, doc, node) -> tuple[Text, int, int]:
+        """When the Code has fewer sentences than the bill counts, the one sentence holding the quoted text.
+        The Code sometimes joins the Act's sentences: 30 U.S.C. 351 runs the Act's "… the Secretary of the
+        Interior. “Mineral leasing laws” shall mean …" together with a comma, so the Act's sixth sentence is
+        the Code's fifth (S. 5653 § 2215(c)(1)(A))."""
+        phrase = inst.args.get("old") or inst.args.get("start")
+        text, start, end = window
+        spans = [(start + a, start + b) for a, b in _sentences(text.current()[start:end])]
+        holding = [s for s in spans if self._hits(phrase, [(text, *s)])] if phrase else []
+        if n < 1 or len(holding) != 1:
+            return self._sentence(window, n, doc, node)  # raises, with the count
+        place = spans.index(holding[0]) + 1
+        self.reworded.append((f"The bill's “{phrase}” is in the {_ordinal(n)} sentence, but the Code prints it in "
+                              f"the {_ordinal(place)} sentence of {_describe(node, doc)}, which has only "
+                              f"{len(spans)}. The Code may join sentences of the Act. Applied there. Check the "
+                              "match.", False, doc, node))
+        return (text, *holding[0])
 
     def _hits(self, phrase, windows, ignore_case=False) -> list[tuple[Text, re.Match]]:
         return [(text, m) for text, start, end in windows for m in _word_matches(phrase, text.current(), ignore_case)
@@ -822,6 +844,10 @@ class Engine:
         existing text into subdivisions: the struck text is replaced by the new ones, and the text that
         followed it continues as the text of the last of them."""
         old, blocks, lead = inst.args["old"], inst.args["blocks"], inst.args.get("lead", "")
+        if inst.args.get("through"):
+            # A span, "X" and all that follows through "Y", is only ever split into new subdivisions.
+            self._split_into(inst, doc, node, old, blocks, at_start=False, lead=lead)
+            return True
         if node is doc.root and len(blocks) == 1 and blocks[0].kind == node.kind == "section" and not lead:
             return self._restate_section(inst, doc, node, old, blocks[0])
         if not old.startswith("("):
@@ -976,7 +1002,16 @@ class Engine:
             problem = "wasn't found" if not hits else f"appears {len(hits)} times"
             raise _NotApplied(f"Not applied: “{old}” {problem} in the text of {_describe(node, doc)}.", doc, node)
         match = hits[0][1]
-        text.strike(match.start(), match.end(), inst.cite)
+        stop = match.end()
+        through = inst.args.get("through")
+        if through:
+            limit = next(e for t, s, e in windows if s <= match.start() and match.end() <= e)
+            ends = self._find(inst, through, [(text, match.end(), limit)], doc, node)
+            if not ends:
+                raise _NotApplied(f"Not applied: “{through}” wasn't found after “{old}” in the text of "
+                                  f"{_describe(node, doc)}.", doc, node)
+            stop = ends[0][1].end()
+        text.strike(match.start(), stop, inst.cite)
         if lead[:1] == "(" and text.current()[match.start() - 1:match.start()].isalnum():
             lead = " " + lead  # a citation run in after a word, as in "Act of 2005 (43 U.S.C. 1337 note)"
         if lead:

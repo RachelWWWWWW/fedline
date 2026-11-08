@@ -950,6 +950,19 @@ class ParserTests(unittest.TestCase):
                                 "and inserting <quote>B.</quote>."),
                          ("replace_span", {"start": "A", "end": None, "end_punct": ".", "new": "B."}))
 
+    def test_strike_through_and_insert_a_block(self):  # S. 5653 § 2215(c)(1)(A)
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 351) is amended, in the sixth "
+            "sentence, by striking <quote>The term</quote> and all that follows through <quote>embrace</quote> and "
+            "inserting the following:</text><quoted-block><paragraph><enum>(5)</enum><header>Oil</header><text>The "
+            "term <term>oil</term> means</text></paragraph><after-quoted-block>;</after-quoted-block></quoted-block>"
+            "</section>")
+        self.assertEqual(bill.problems, [])
+        (inst,) = bill.instructions
+        self.assertEqual((inst.action, inst.args["old"], inst.args["through"]),
+                         ("replace_with_block", "The term", "embrace"))
+        self.assertEqual(inst.within, [("sentence", 6)])
+
     def test_within_locators(self):
         bill = parse_sections(
             "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended—</text>"
@@ -1127,6 +1140,46 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(marked(first.body), "[+The fee+] is due. [-The location fee-]")
         self.assertEqual(marked(second.body), "[+The location fee+] is $5.")
         self.assertEqual(node.before_text(), "(b)The fee is due. The location fee is $5.")
+
+    def test_a_struck_span_gives_way_to_new_subdivisions(self):  # S. 5653 § 2215(c)(1)(A), 30 U.S.C. 351
+        node = Node("section", "351", label=Text("§ 351."),
+                    body=Text("The term Secretary means the Secretary. The term oil shall embrace all gases."))
+        doc = SimpleNamespace(title="Test", root=node)
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                           args={"old": "The term", "through": "embrace",
+                                 "blocks": [new_node("paragraph", "5", "Oil", "The term oil means")]},
+                           within=[("sentence", 2)])
+        Engine(SimpleNamespace(), {})._operate(inst, doc, node)
+        self.assertEqual(marked(node.body), "The term Secretary means the Secretary. [-The term oil shall embrace-]")
+        self.assertEqual(marked(node.children[0].body), "[+The term oil means+] all gases.")
+
+    def test_a_sentence_the_code_joins_to_another_is_found_by_its_text(self):
+        # 30 U.S.C. 351 prints the Act's third and fourth sentences as one, so the bill's sixth is the Code's fifth.
+        node = Node("section", "351", label=Text("§ 351."), body=Text(
+            "“Secretary” means the Secretary of the Interior, “Mineral leasing laws” shall mean the Act. "
+            "The term “oil” shall embrace all hydrocarbons."))
+        doc = SimpleNamespace(title="Test", root=node)
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                           args={"old": "The term", "through": "embrace",
+                                 "blocks": [new_node("paragraph", "5", "Oil", "The term oil means")]},
+                           within=[("sentence", 3)])
+        engine = Engine(SimpleNamespace(), {})
+        engine._operate(inst, doc, node)
+        self.assertEqual(marked(node.children[0].body), "[+The term oil means+] all hydrocarbons.")
+        self.assertIn("the second sentence", engine.reworded[0][0])
+        with self.assertRaises(_NotApplied):  # text in no sentence, or the count alone, can't place it
+            engine._operate(Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace",
+                                        args={"old": "gilsonite", "new": "", "every": False, "except": None},
+                                        within=[("sentence", 3)]), doc, node)
+
+    def test_a_struck_span_needs_its_end(self):
+        node = Node("section", "351", label=Text("§ 351."), body=Text("The term oil shall include all gases."))
+        doc = SimpleNamespace(title="Test", root=node)
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                           args={"old": "The term", "through": "embrace",
+                                 "blocks": [new_node("paragraph", "5", "Oil", "The term oil means")]}, within=[])
+        with self.assertRaises(_NotApplied):
+            Engine(SimpleNamespace(), {})._operate(inst, doc, node)
 
     def test_subdivisions_split_off_earlier_move_under_the_new_one_that_precedes_them(self):
         # 54 U.S.C. 306108: S. 5653 § 2301(c)(1) makes the second sentence paragraph (2), then (c)(2) makes the

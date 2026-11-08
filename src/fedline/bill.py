@@ -407,6 +407,13 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
             "end_punct": _PUNCTUATION.get(match.group("pc") or ""),
             "new": new_text(match)}
 
+    # The struck span gives way to new subdivisions, as in S. 5653 § 2215(c)(1)(A): 'in the sixth sentence,
+    # by striking "The term" and all that follows through "embrace" and inserting the following: (5) Oil.—'.
+    match = re.fullmatch(r"by striking ⟦(?P<a>\d+)⟧ and all that follows through ⟦(?P<c>\d+)⟧ and inserting the "
+                         r"following:?", text)
+    if match and blocks:
+        return "replace_with_block", {"old": q(match, "a"), "through": q(match, "c"), "blocks": blocks, "lead": lead}
+
     match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ after the (?P<unit>\w+) designation", text)
     if match and match.group("unit") in LEVELS:
         return "insert_at_start", {"new": q(match, "a"), "unit": match.group("unit")}

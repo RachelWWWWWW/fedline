@@ -354,6 +354,8 @@ class Engine:
         target = inst.target
         if target.is_note:
             return self._apply_note(inst)
+        if target.chapter and target.toc:
+            return self._apply_toc(inst)
         if target.chapter:
             return self._apply_chapter(inst)
         if target.name.startswith("title "):
@@ -1337,6 +1339,43 @@ class Engine:
                 self._flag(inst.cite, f"{target.title} U.S.C. § {asked} already exists, so the new section is added "
                                       f"as § {number}, the next number not in use. Check the numbering.", False, doc)
             self.docs[doc.key] = doc
+        return True
+
+    def _apply_toc(self, inst) -> bool:
+        """'The table of sections for chapter 3027 of title 54, United States Code, is amended by adding at the
+        end the following: 302707. Program evaluation.' Each new entry is checked against the chapter's
+        sections, including those the bill adds, which may have been added under another number."""
+        target = inst.target
+        title = self.titles.get(target.title)
+        entries = inst.args.get("blocks", [])
+        if inst.action != "add_at_end" or inst.path or not entries or any(b.kind != "toc-entry" for b in entries):
+            return self._not_redlined(inst, "only adding entries at the end of a chapter's table of sections is "
+                                            "supported")
+        found = title.chapter_toc(target.chapter) if title else None
+        if found is None:
+            return self._not_redlined(inst, f"{target.name} wasn't found in the Code")
+        doc = self.docs.setdefault(found.key, found)
+        existing = {c.value for c in doc.root.children if not c.deleted}
+        chapter = set(title.chapter_sections(target.chapter))
+        added = {d.root.value: d for d in self.docs.values()
+                 if d.basis == "new" and d.key.startswith(f"new:{target.title}usc")}
+        for entry in entries:
+            number = entry.value
+            if number in existing:
+                self._flag(inst.cite, f"The table of sections already lists § {number}.", False, doc, entry)
+            elif number in added:
+                if added[number].root.heading.current().rstrip(".") != entry.body.current().rstrip("."):
+                    self._flag(inst.cite, f"The new entry for § {number} reads “{entry.body.current()}”, but the "
+                                          f"new section's heading is “{added[number].root.heading.current()}”. Check "
+                                          "the entry.", False, doc, entry)
+            elif number in chapter:
+                self._flag(inst.cite, f"The table of sections gets an entry for § {number}, which the chapter "
+                                      "already has but the table didn't list.", False, doc, entry)
+            else:
+                self._flag(inst.cite, f"The new entry is for § {number}, but the chapter has no § {number} and the "
+                                      "bill doesn't add one under that number. A new section may have been added "
+                                      "under the next free number; check the entry.", False, doc, entry)
+        doc.root.children.extend(entries)
         return True
 
     def _add_sections_at_end(self, inst, act: Act) -> bool:

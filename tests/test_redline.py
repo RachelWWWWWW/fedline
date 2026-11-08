@@ -673,6 +673,58 @@ class LeadInTests(unittest.TestCase):
         target = self.target("Chapter 3027 of title 54, United States Code, is amended")
         self.assertEqual((target.title, target.chapter), (54, "3027"))
 
+    def test_code_chapter_table_of_sections(self):
+        target = self.target("The table of sections for chapter 3027 of title 54, United States Code, is amended")
+        self.assertEqual((target.title, target.chapter, target.toc), (54, "3027", True))
+
+
+class TableOfSectionsTests(unittest.TestCase):
+    """S. 5653 § 2301(b)(2)(A) adds 54 U.S.C. 302707, and (b)(4) adds it to the chapter's table of sections."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>54</docNumber></meta><main>'
+            '<chapter identifier="/us/usc/t54/stIII/dA/sd2/ch3027"><num value="3027">CHAPTER 3027—</num>'
+            '<heading>PROGRAMS FOR INDIAN TRIBES</heading><toc><layout><header role="tocColumnHeader"><column>Sec.'
+            '</column></header><tocItem><column><ref href="/us/usc/t54/s302701">302701.</ref></column><column>'
+            'Program to assist Indian tribes.</column></tocItem><tocItem><column><ref href="/us/usc/t54/s302702">'
+            '302702.</ref></column><column>Indian tribe to assume functions.</column></tocItem></layout></toc>'
+            '<section identifier="/us/usc/t54/s302701"><num value="302701">§ 302701.</num><heading>Program</heading>'
+            '<content>The Secretary shall assist.</content></section>'
+            '<section identifier="/us/usc/t54/s302702"><num value="302702">§ 302702.</num><heading>Functions'
+            '</heading><content>A tribe may assume functions.</content></section></chapter></main></uscDoc>').encode()
+
+    def run_bill(self, entry, section="302707"):
+        bill = parse_sections(
+            '<section><enum>2.</enum><text>Chapter 3027 of title 54, United States Code, is amended by adding at '
+            f'the end the following:</text><quoted-block><section id="s1"><enum>{section}.</enum><header>Program '
+            'evaluation</header><text>The Secretary shall evaluate.</text></section></quoted-block></section>'
+            '<section><enum>3.</enum><text>The table of sections for chapter 3027 of title 54, United States Code, '
+            'is amended by adding at the end the following:</text><quoted-block><toc><toc-entry level="section" '
+            f'idref="s1">{entry}</toc-entry></toc><after-quoted-block>.</after-quoted-block></quoted-block>'
+            '</section>')
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {54: CodeTitle(self.CODE)})
+        passed = verify(bill, outcome)
+        docs = {d.title: d for d in outcome.documents}
+        return outcome, passed, docs
+
+    def test_an_entry_is_added_at_the_end_of_the_table(self):
+        outcome, passed, docs = self.run_bill("302707. Program evaluation.")
+        self.assertEqual((outcome.applied, outcome.flags), (2, []))
+        self.assertEqual(list(docs), ["54 U.S.C. chapter 3027, table of sections", "New 54 U.S.C. § 302707"])
+        entries = docs["54 U.S.C. chapter 3027, table of sections"].root.children
+        self.assertEqual([(marked(e.label), marked(e.body)) for e in entries], [
+            ("302701.", "Program to assist Indian tribes."), ("302702.", "Indian tribe to assume functions."),
+            ("[+302707.+]", "[+Program evaluation.+]")])
+        self.assertIn("Original text in the redline matches the source XML in every section.", passed)
+        self.assertTrue(any(p.startswith("All inserted text appears verbatim in the bill") for p in passed))
+
+    def test_an_entry_that_doesnt_match_the_new_section_is_flagged(self):
+        outcome, _, _ = self.run_bill("302707. Program review.")
+        self.assertEqual(outcome.applied, 2)
+        self.assertTrue(any("new section's heading is “Program evaluation”" in f.message for f in outcome.flags))
+        # The new section is added as § 302703, the next free number, so the entry for § 302702 isn't for it.
+        outcome, _, _ = self.run_bill("302702. Program evaluation.", section="302702")
+        self.assertTrue(any("already lists § 302702" in f.message for f in outcome.flags))
+
 
 class WholeSectionTests(unittest.TestCase):
     CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>42</docNumber></meta><main>'

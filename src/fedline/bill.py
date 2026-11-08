@@ -26,8 +26,8 @@ _LEAD_CODE = re.compile(
     r"(?:, as amended by [^,]+)?, is (?:further )?amended(?P<rest>.*)$"
 )
 _LEAD_CHAPTER = re.compile(
-    r"^Chapter (?P<chapter>\w+) of title (?P<title>\d+), United States Code"
-    r"(?:, as amended by [^,]+)?, is (?:further )?amended(?P<rest>.*)$"
+    r"^(?:Chapter|(?P<toc>The table of sections for chapter)) (?P<chapter>\w+) of title (?P<title>\d+), "
+    r"United States Code(?:, as amended by [^,]+)?, is (?:further )?amended(?P<rest>.*)$"
 )
 # An Act named without a citation, as in "The Federal Power Act is amended by inserting after section 216
 # (16 U.S.C. 824p) the following:". The citation, if any, comes later in the instruction.
@@ -65,6 +65,7 @@ class Target:
     is_note: bool = False
     public_law: str | None = None
     chapter: str | None = None
+    toc: bool = False  # the chapter's table of sections, not its text
 
 
 @dataclass
@@ -154,6 +155,9 @@ def _parse_target(match: re.Match) -> Target | None:
         target.title = int(groups["title"])
         target.chapter = groups["chapter"]
         target.name = f"chapter {groups['chapter']} of title {groups['title']}, United States Code"
+        if groups.get("toc"):
+            target.toc = True
+            target.name = f"the table of sections for {target.name}"
         target.cite = target.name
         return target
     if groups.get("title"):
@@ -567,10 +571,21 @@ def _new_node(el: ET.Element, source: str) -> Node:
     return node
 
 
+def _toc_entry(el: ET.Element, source: str) -> Node:
+    """An entry for a table of sections, as in '302707. Program evaluation.'"""
+    text = norm(_quoted_flat(el))
+    match = re.match(r"(?:Sec\. )?(\w+)\.\s+", text)
+    number = match.group(0).strip() if match else ""
+    return Node(kind="toc-entry", value=match.group(1) if match else "", label=Text(number, INS, (source,)),
+                body=Text(text[len(match.group(0)):] if match else text, INS, (source,)))
+
+
 def _block_nodes(el: ET.Element, source: str) -> list[Node]:
     blocks = []
     for block in el.findall("quoted-block"):
         blocks.extend(_new_node(child, source) for child in block if child.tag in LEVELS)
+        for toc in block.findall("toc"):
+            blocks.extend(_toc_entry(entry, source) for entry in toc.findall("toc-entry"))
     return blocks
 
 

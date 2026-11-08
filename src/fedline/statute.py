@@ -360,6 +360,37 @@ class CodeTitle:
                         for n in re.findall(r"^/us/usc/t\d+[a-zA-Z]?/s([^/]+)$", s.get("identifier") or "")]
         return []
 
+    def chapter_toc(self, chapter: str) -> Document | None:
+        """A chapter's table of sections, as a document of entries such as '302701. Program to assist …'. It
+        comes just before the chapter's first section."""
+        for el in self.root.iter(f"{{{self.ns}}}chapter"):
+            num = el.find(f"{{{self.ns}}}num")
+            if num is None or num.get("value") != chapter:
+                continue
+            toc = el.find(f"{{{self.ns}}}toc")
+            if toc is None:
+                return None
+            root = Node("toc", value=chapter)
+            source = []
+            for item in toc.iter(f"{{{self.ns}}}tocItem"):
+                columns = [_flat(c) for c in item.findall(f"{{{self.ns}}}column")]
+                if not columns:
+                    continue
+                number, words = columns[0], " ".join(columns[1:])
+                root.children.append(Node("toc-entry", value=number.rstrip("."), label=Text(number),
+                                          body=Text(words)))
+                source.append(number + words)
+            sections = self.chapter_sections(chapter)
+            return Document(
+                key=f"{self.number}usc-ch{chapter}-toc",
+                title=f"{self.number} U.S.C. chapter {chapter}, table of sections",
+                root=root,
+                basis="code",
+                source_text="".join(source),
+                order=(self.number, _sort_key(sections[0] if sections else chapter), -1),
+            )
+        return None
+
     def document(self, number: str) -> Document | None:
         el = self.sections.get(number)
         if el is None:

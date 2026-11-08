@@ -35,6 +35,9 @@ class Outcome:
     applied: int = 0
     failed: int = 0
     release_points: dict[int, str] = field(default_factory=dict)
+    # Headings taken from a provision's own text, as the term it defines, where the bill describes the heading
+    # rather than quoting it: (node, heading). Verification checks them against the provision, not the bill.
+    term_headings: list[tuple[Node, str]] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -455,6 +458,8 @@ class Engine:
             return self._edit_sentence(inst, doc, node)
         if action == "replace_sentence_with_block":
             return self._replace_sentence_with_block(inst, doc, node)
+        if action == "insert_term_heading":
+            return self._insert_term_heading(inst, doc, node)
         if action == "delete_nodes":
             for child in self._children(inst, doc, node, args["values"], args["kind"]):
                 child.delete(inst.cite)
@@ -1133,6 +1138,30 @@ class Engine:
                               f"{_describe(node, doc)}, so the new subdivisions have no place there.", doc, node)
         self._split_into(inst, doc, node, text.current()[start:end], inst.args["blocks"], at_start=False,
                          lead=inst.args.get("lead", ""), span=(start, end))
+        return True
+
+    def _insert_term_heading(self, inst, doc, node) -> bool:
+        """'By inserting a paragraph heading, the text of which comprises the term defined in that paragraph'
+        (S. 5653 § 2222(a)(1)(G)(ii)). The heading is the term the provision's opening defines, capitalized as
+        bills write headings; two or more terms are joined with semicolons, as in the bill's own "Acquired
+        lands; lands acquired by the United States"."""
+        unit = inst.args["unit"]
+        if node.kind != unit:
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} isn't a {unit}.", doc, node)
+        if node.heading.current().strip():
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} already has a heading.", doc, node)
+        quoted = r"“[^“”]+”"
+        match = re.match(rf"(?:The terms? )?({quoted}(?:(?:,? and|,? or|,) {quoted})*)", node.body.current())
+        if match is None:
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't open with the term it defines, so "
+                              "there's no term for its heading.", doc, node)
+        terms = re.findall(r"“([^“”]+)”", match.group(1))
+        heading = "; ".join(terms)
+        heading = heading[:1].upper() + heading[1:]
+        node.heading.insert(0, heading, (inst.cite,))
+        self.outcome.term_headings.append((node, heading))
+        self.reworded.append((f"The heading “{heading}” isn't quoted in the bill: it's the term {_describe(node, doc)} "
+                              "defines, as the instruction directs, taken from its text. Check it.", False, doc, node))
         return True
 
     def _insert_text(self, inst, doc, node) -> bool:

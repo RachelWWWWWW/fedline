@@ -469,6 +469,13 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
         if values:
             return "delete_nodes", {"kind": kind, "values": values}
 
+    # A heading the bill describes rather than quotes: "by inserting a paragraph heading, the text of which
+    # comprises the term defined in that paragraph" (S. 5653 § 2222(a)(1)(G)(ii)).
+    match = re.fullmatch(rf"by inserting an? ({kinds}) heading, the text of which (?:comprises|consists of|is) the "
+                         r"terms? defined in (?:that|such|the) (\w+)", text)
+    if match and _LEVEL_WORDS[match.group(1)] == _LEVEL_WORDS.get(match.group(2)):
+        return "insert_term_heading", {"unit": _LEVEL_WORDS[match.group(1)]}
+
     # Formatting only: "by indenting clauses (i) through (v) appropriately", "by moving the margins of
     # subparagraphs (A) and (B) 2 ems to the right".
     match = re.fullmatch(

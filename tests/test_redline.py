@@ -198,6 +198,33 @@ class RedesignateTests(unittest.TestCase):
         docs = [d for d in outcome.documents if d.title == "30 U.S.C. § 1001"]
         return bill, outcome, docs[0].root if docs else None
 
+    def test_a_described_heading_is_the_term_the_paragraph_defines(self):  # S. 5653 § 2222(a)(1)(G)
+        bill, outcome, root = self.run_bill(
+            "<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), respectively;</text>",
+            "<text>in each of paragraphs (1) and (3)—</text><subparagraph><enum>(A)</enum><text>by inserting "
+            "<quote>The term</quote> after the paragraph designation; and</text></subparagraph><subparagraph>"
+            "<enum>(B)</enum><text>by inserting a paragraph heading, the text of which comprises the term defined in "
+            "that paragraph;</text></subparagraph>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual(outcome.applied, 3)
+        self.assertEqual([marked(c.heading) for c in root.children], ["[+Secretary+]", "", "[+Byproduct+]"])
+        self.assertEqual(marked(root.children[2].body), "[+The term +]“byproduct” means a mineral.")
+        passed = verify(bill, outcome)
+        self.assertFalse([f for f in outcome.flags if f.blocking])
+        self.assertIn("All inserted text appears verbatim in the bill, except headings the bill describes rather "
+                      "than quotes, which match the terms their provisions define.", passed)
+        self.assertEqual(sum("isn't quoted in the bill" in f.message for f in outcome.flags), 2)
+
+    def test_a_described_heading_that_no_longer_matches_fails_verification(self):
+        bill, outcome, root = self.run_bill(
+            "<text>in subsection (c), by inserting a subsection heading, the text of which comprises the term "
+            "defined in that subsection.</text>")
+        self.assertEqual(outcome.applied, 1)
+        root.children[2].body = Text("Something else.")
+        passed = verify(bill, outcome)
+        self.assertTrue(any("isn't a term its provision defines" in f.message for f in outcome.flags))
+        self.assertFalse(any(p.startswith("All inserted text") for p in passed))
+
     def test_redesignated_subdivisions_take_the_new_kind(self):
         bill, outcome, root = self.run_bill(
             "<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), respectively, and "
@@ -963,6 +990,20 @@ class ParserTests(unittest.TestCase):
                          ("replace_with_block", "The term", "embrace"))
         self.assertEqual(inst.within, [("sentence", 6)])
 
+    def test_insert_a_described_heading(self):  # S. 5653 § 2222(a)(1)(G)(ii)
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 1001) is amended, in paragraph (1), "
+            "by inserting a paragraph heading, the text of which comprises the term defined in that paragraph;"
+            "</text></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual((bill.instructions[0].action, bill.instructions[0].args),
+                         ("insert_term_heading", {"unit": "paragraph"}))
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 1001) is amended, in paragraph (1), "
+            "by inserting a paragraph heading, the text of which comprises the term defined in that subsection;"
+            "</text></section>")
+        self.assertEqual(len(bill.problems), 1)  # the levels must agree
+
     def test_strike_a_sentence_and_insert_a_block(self):  # S. 5653 § 2215(c)(1)(C)
         bill = parse_sections(
             "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 351) is amended by striking the "
@@ -1240,6 +1281,22 @@ class BlockTests(unittest.TestCase):
                 cite="§ 9", raw="", target=Target(), path=[], action="replace_sentence_with_block",
                 args={"n": 4, "blocks": [new_node("paragraph", "4", "Fee", "The term")]}),
                 SimpleNamespace(title="Test", root=node), node)
+
+    def test_a_described_heading_joins_two_terms_and_needs_a_term_and_no_heading(self):
+        def apply(node):
+            Engine(SimpleNamespace(), {})._operate(Instruction(
+                cite="§ 9", raw="", target=Target(), path=[], action="insert_term_heading",
+                args={"unit": "paragraph"}), SimpleNamespace(title="Test", root=node), node)
+
+        node = Node("paragraph", "1", label=Text("(1)"),
+                    body=Text("The terms “acquired lands” and “lands acquired by the United States” mean lands."))
+        apply(node)
+        self.assertEqual(marked(node.heading), "[+Acquired lands; lands acquired by the United States+]")
+        for node in (Node("paragraph", "1", label=Text("(1)"), heading=Text("Lands"), body=Text("“Lands” means x.")),
+                     Node("paragraph", "1", label=Text("(1)"), body=Text("Lands are defined as “x”.")),
+                     Node("subparagraph", "A", label=Text("(A)"), body=Text("“Lands” means x."))):
+            with self.assertRaises(_NotApplied):
+                apply(node)
 
     def test_a_struck_span_needs_its_end(self):
         node = Node("section", "351", label=Text("§ 351."), body=Text("The term oil shall include all gases."))

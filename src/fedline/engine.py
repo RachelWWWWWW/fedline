@@ -192,6 +192,11 @@ def _sentences(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+# Where the Code runs two of an Act's definitions together with a comma, as 30 U.S.C. 351 does with the Act's
+# "… the Secretary of the Interior. “Mineral leasing laws” shall mean …".
+_JOINED_DEFINITION = re.compile(r", (?=“([A-Z][^”]*)” (?:shall mean|means|shall include|includes?|shall embrace)\b)")
+
+
 def _ordinal(n: int) -> str:
     return {-1: "last"}.get(n) or ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
                                    "ninth", "tenth"][n - 1]
@@ -448,6 +453,8 @@ class Engine:
             return self._replace_across(inst, doc, node)
         if action in ("replace_sentence", "insert_after_sentence"):
             return self._edit_sentence(inst, doc, node)
+        if action == "replace_sentence_with_block":
+            return self._replace_sentence_with_block(inst, doc, node)
         if action == "delete_nodes":
             for child in self._children(inst, doc, node, args["values"], args["kind"]):
                 child.delete(inst.cite)
@@ -575,7 +582,7 @@ class Engine:
         if len(windows) == 1:
             return windows[0]
         body = node.body.current()
-        if n > 0 and body and len(_sentences(body)) >= n:
+        if n > 0 and body and len(self._counted(body, n, doc, node)) >= n:
             return (node.body, 0, len(body))
         phrase = inst and (inst.args.get("old") or inst.args.get("start"))
         hits = self._hits(phrase, windows) if phrase and n > 0 and body else []
@@ -586,11 +593,35 @@ class Engine:
 
     def _sentence(self, window, n, doc, node) -> tuple[Text, int, int]:
         text, start, end = window
-        spans = [(start + a, start + b) for a, b in _sentences(text.current()[start:end])]
+        spans = [(start + a, start + b) for a, b in self._counted(text.current()[start:end], n, doc, node)]
         if n > len(spans) or (n == -1 and len(spans) < 2):
             raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't have a {_ordinal(n)} sentence "
                               f"(it has {len(spans)}).", doc, node)
         return (text, *spans[n - 1 if n > 0 else -1])
+
+    def _counted(self, text: str, n: int, doc, node) -> list[tuple[int, int]]:
+        """The sentences of text, as the bill counts them to reach sentence n. When the Code has too few and
+        the shortfall is exactly the number of definitions it runs together with a comma, it's counted as
+        though those were the Act's periods, and the count is noted for review."""
+        spans = _sentences(text)
+        if n < 1 or n <= len(spans):
+            return spans
+        joins = list(_JOINED_DEFINITION.finditer(text))
+        if len(joins) != n - len(spans):
+            return spans
+        split = []
+        for a, b in spans:
+            for m in joins:
+                if a < m.start() < b:  # the comma ends a sentence, and the next starts at the quote
+                    split.append((a, m.start() + 1))
+                    a = m.end()
+            split.append((a, b))
+        terms = " and ".join(f"“{m.group(1)}”" for m in joins)
+        self.reworded.append((f"The Code runs sentences of {_describe(node, doc)} together with a comma before "
+                              f"{terms}, where the Act has a period, so it has {len(spans)} sentences where the "
+                              f"bill counts at least {n}. Counted as the Act's sentences. Check the match.",
+                              False, doc, node))
+        return split
 
     def _sentence_by_text(self, inst, window, n, doc, node) -> tuple[Text, int, int]:
         """When the Code has fewer sentences than the bill counts, the one sentence holding the quoted text.
@@ -983,11 +1014,12 @@ class Engine:
         self._check_duplicates(inst, doc, node)
         return True
 
-    def _split_into(self, inst, doc, node, old, blocks, at_start, lead="") -> None:
+    def _split_into(self, inst, doc, node, old, blocks, at_start, lead="", span=None) -> None:
         """Strike old from node's introductory text and put blocks in its place as new subdivisions, moving
         the text that followed old into the last of them. Run-in text the new subdivisions follow, as in
         "the Secretary—", takes old's place. New provisions at node's own level, as in 'in
-        paragraph (1), by striking "to promote" and inserting (2) to promote', follow node instead."""
+        paragraph (1), by striking "to promote" and inserting (2) to promote', follow node instead. span,
+        (start, stop) in node's introductory text, is struck text already found, such as a whole sentence."""
         if inst.within and inst.within[-1][0] == "following":
             return self._split_trailing(inst, doc, node, old, blocks, lead)
         if any(c.label.before() for c in node.children if not c.deleted):
@@ -999,29 +1031,16 @@ class Engine:
             raise _NotApplied(f"Not applied: the new {blocks[0].kind} can't go inside {_describe(node, doc)}.",
                               doc, node)
         text = node.body
-        windows = [w for w in self._scope(inst, doc, node) if w[0] is text]
-        hits = self._find(inst, old, windows, doc, node)
-        if at_start:
-            hits = [(t, m) for t, m in hits if m.start() == 0]
-        if len(hits) != 1:
-            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
-            raise _NotApplied(f"Not applied: “{old}” {problem} in the text of {_describe(node, doc)}.", doc, node)
-        match = hits[0][1]
-        stop = match.end()
-        through = inst.args.get("through")
-        if through:
-            limit = next(e for t, s, e in windows if s <= match.start() and match.end() <= e)
-            ends = self._find(inst, through, [(text, match.end(), limit)], doc, node)
-            if not ends:
-                raise _NotApplied(f"Not applied: “{through}” wasn't found after “{old}” in the text of "
-                                  f"{_describe(node, doc)}.", doc, node)
-            stop = ends[0][1].end()
-        text.strike(match.start(), stop, inst.cite)
-        if lead[:1] == "(" and text.current()[match.start() - 1:match.start()].isalnum():
+        if span is None:
+            begin, stop = self._split_span(inst, doc, node, old, at_start)
+        else:
+            begin, stop = span
+        text.strike(begin, stop, inst.cite)
+        if lead[:1] == "(" and text.current()[begin - 1:begin].isalnum():
             lead = " " + lead  # a citation run in after a word, as in "Act of 2005 (43 U.S.C. 1337 note)"
         if lead:
-            text.insert(match.start(), lead, (inst.cite,))
-        rest = text.cut(match.start() + len(lead))
+            text.insert(begin, lead, (inst.cite,))
+        rest = text.cut(begin + len(lead))
         last = blocks[-1]
         while last.children:
             last = last.children[-1]
@@ -1042,6 +1061,27 @@ class Engine:
         container.children.extend(node.children)
         node.children = blocks
         self._check_duplicates(inst, doc, container)
+
+    def _split_span(self, inst, doc, node, old, at_start) -> tuple[int, int]:
+        """Where old is in node's introductory text, through the instruction's "through" phrase if any."""
+        text = node.body
+        windows = [w for w in self._scope(inst, doc, node) if w[0] is text]
+        hits = self._find(inst, old, windows, doc, node)
+        if at_start:
+            hits = [(t, m) for t, m in hits if m.start() == 0]
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{old}” {problem} in the text of {_describe(node, doc)}.", doc, node)
+        match = hits[0][1]
+        through = inst.args.get("through")
+        if not through:
+            return match.start(), match.end()
+        limit = next(e for t, s, e in windows if s <= match.start() and match.end() <= e)
+        ends = self._find(inst, through, [(text, match.end(), limit)], doc, node)
+        if not ends:
+            raise _NotApplied(f"Not applied: “{through}” wasn't found after “{old}” in the text of "
+                              f"{_describe(node, doc)}.", doc, node)
+        return match.start(), ends[0][1].end()
 
     def _split_trailing(self, inst, doc, node, old, blocks, lead) -> None:
         """'In the matter following clause (ii), by striking "The Secretary" and inserting (C) The Secretary':
@@ -1080,6 +1120,19 @@ class Engine:
             text.insert(end, f" {new}", (inst.cite,))
         else:
             _swap(text, start, end, new, inst.cite)
+        return True
+
+    def _replace_sentence_with_block(self, inst, doc, node) -> bool:
+        """'By striking the fourth sentence and inserting the following: (4) Mineral leasing laws.— …'
+        (S. 5653 § 2215(c)(1)(C)). The sentence gives way to the new subdivisions, as struck text does in
+        _split_into."""
+        n = inst.args["n"]
+        text, start, end = self._sentence(self._sentence_base(self._scope(inst, doc, node), n, doc, node), n, doc, node)
+        if text is not node.body:
+            raise _NotApplied(f"Not applied: the {_ordinal(n)} sentence isn't in the introductory text of "
+                              f"{_describe(node, doc)}, so the new subdivisions have no place there.", doc, node)
+        self._split_into(inst, doc, node, text.current()[start:end], inst.args["blocks"], at_start=False,
+                         lead=inst.args.get("lead", ""), span=(start, end))
         return True
 
     def _insert_text(self, inst, doc, node) -> bool:

@@ -963,6 +963,16 @@ class ParserTests(unittest.TestCase):
                          ("replace_with_block", "The term", "embrace"))
         self.assertEqual(inst.within, [("sentence", 6)])
 
+    def test_strike_a_sentence_and_insert_a_block(self):  # S. 5653 § 2215(c)(1)(C)
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 351) is amended by striking the "
+            "fourth sentence and inserting the following:</text><quoted-block><paragraph><enum>(4)</enum><header>"
+            "Mineral leasing laws</header><text>The term <term>mineral leasing laws</term> means the Act.</text>"
+            "</paragraph><after-quoted-block>;</after-quoted-block></quoted-block></section>")
+        self.assertEqual(bill.problems, [])
+        (inst,) = bill.instructions
+        self.assertEqual((inst.action, inst.args["n"], len(inst.args["blocks"])), ("replace_sentence_with_block", 4, 1))
+
     def test_within_locators(self):
         bill = parse_sections(
             "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended—</text>"
@@ -1154,10 +1164,9 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(marked(node.children[0].body), "[+The term oil means+] all gases.")
 
     def test_a_sentence_the_code_joins_to_another_is_found_by_its_text(self):
-        # 30 U.S.C. 351 prints the Act's third and fourth sentences as one, so the bill's sixth is the Code's fifth.
+        # The Code has a sentence fewer than the bill counts, and nothing shows where it joined two.
         node = Node("section", "351", label=Text("§ 351."), body=Text(
-            "“Secretary” means the Secretary of the Interior, “Mineral leasing laws” shall mean the Act. "
-            "The term “oil” shall embrace all hydrocarbons."))
+            "The fee is due, and the Secretary sets it. The term “oil” shall embrace all hydrocarbons."))
         doc = SimpleNamespace(title="Test", root=node)
         inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
                            args={"old": "The term", "through": "embrace",
@@ -1193,11 +1202,44 @@ class BlockTests(unittest.TestCase):
         engine = apply(node)
         self.assertEqual([c.value for c in node.children], ["3", "5"])
         self.assertEqual(marked(node.children[0].body), "[+The term “lease”+] includes “prospecting permit”.")
+        self.assertIn("with a comma before “Mineral leasing laws”", engine.reworded[0][0])
+        node = section()
+        node.body = Text("“Secretary” means the Secretary; and the Act applies. “Lease” includes “prospecting permit”.")
+        engine = apply(node)  # nothing shows where the Code joined sentences, but only one has the quoted text
         self.assertIn("the second sentence", engine.reworded[0][0])
         node = section()
+        node.body = Text("“Secretary” means the Secretary; and the Act applies. “Lease” includes “prospecting permit”.")
         node.children[0].body = Text("The term “oil” means oil. “Lease” has its own meaning.")
         with self.assertRaises(_NotApplied):  # the quoted text is in a subdivision too
             apply(node)
+
+    def test_a_sentence_the_code_joins_with_a_comma_gives_way_to_new_subdivisions(self):
+        # S. 5653 § 2215(c)(1)(C): 30 U.S.C. 351 runs the Act's third and fourth sentences together.
+        node = Node("section", "351", label=Text("§ 351."), body=Text(
+            "“United States” includes Alaska. “Secretary” means the Secretary of the Interior, “Mineral leasing "
+            "laws” shall mean the Act of 1920 and Acts amendatory of it."),
+            children=[new_node("paragraph", "5", "Oil", "The term “oil” means oil.")])
+        block = new_node("paragraph", "4", "Mineral leasing laws", "The term “mineral leasing laws” means—", [
+            new_node("subparagraph", "A", "", "the Mineral Leasing Act; and"),
+            new_node("subparagraph", "B", "", "all Acts amendatory of it.")])
+        engine = Engine(SimpleNamespace(), {})
+        engine._operate(Instruction(cite="§ 9", raw="", target=Target(), path=[],
+                                    action="replace_sentence_with_block", args={"n": 3, "blocks": [block]}),
+                        SimpleNamespace(title="Test", root=node), node)
+        self.assertEqual(marked(node.body), "“United States” includes Alaska. “Secretary” means the Secretary of the "
+                                            "Interior, [-“Mineral leasing laws” shall mean the Act of 1920 and Acts "
+                                            "amendatory of it.-]")
+        self.assertEqual([c.value for c in node.children], ["4", "5"])
+        self.assertIn("with a comma before “Mineral leasing laws”", engine.reworded[0][0])
+
+    def test_a_sentence_with_too_few_joins_is_not_counted(self):
+        node = Node("section", "1", label=Text("§ 1."), body=Text(
+            "“Secretary” means the Secretary, “Act” means the Act. “Fee” means $5."))
+        with self.assertRaises(_NotApplied):
+            Engine(SimpleNamespace(), {})._operate(Instruction(
+                cite="§ 9", raw="", target=Target(), path=[], action="replace_sentence_with_block",
+                args={"n": 4, "blocks": [new_node("paragraph", "4", "Fee", "The term")]}),
+                SimpleNamespace(title="Test", root=node), node)
 
     def test_a_struck_span_needs_its_end(self):
         node = Node("section", "351", label=Text("§ 351."), body=Text("The term oil shall include all gases."))

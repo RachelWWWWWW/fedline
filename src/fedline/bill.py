@@ -500,6 +500,10 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     if match:
         return "reorder", {"kind": _LEVEL_WORDS[match.group(1)]}
 
+    match = re.fullmatch(rf"by striking the ({_ORDINAL}) sentence and inserting the following:?", text)
+    if match and blocks:
+        return "replace_sentence_with_block", {"n": _ORDINALS[match.group(1)], "blocks": blocks, "lead": lead}
+
     match = re.fullmatch(
         rf"by striking the ({_ORDINAL}) sentence(?: and inserting the following:? ⟦(?P<b>\d+)⟧)?", text)
     if match:

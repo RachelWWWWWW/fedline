@@ -1,6 +1,7 @@
 """End-to-end and unit tests, using H.R. 10453 and the Code sections it amends."""
 
 import os
+import re
 import tempfile
 import unittest
 import zipfile
@@ -12,9 +13,10 @@ from fedline.bill import _designators, parse_bill
 from fedline.cli import redline
 from fedline.docx_writer import write_docx
 from fedline.bill import Instruction, Target
-from fedline.engine import Engine, _NotApplied, _sentences, _word_matches, apply_bill
+from fedline.engine import Engine, _NotApplied, _code_wording, _next_free, _sentences, _word_matches, apply_bill
 from fedline.sources import SourceError, parse_bill_url
-from fedline.statute import CodeTitle, DEL, INS, Node, Text, _strip_ws, credit_origin
+from fedline.verify import verify
+from fedline.statute import CodeTitle, DEL, INS, MOVED, Node, Text, _strip_ws, credit_origin
 
 FIXTURES = Path(__file__).parent / "fixtures"
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -29,7 +31,7 @@ def run_bill():
 def marked(text: Text) -> str:
     out = ""
     for seg in text.segments:
-        out += {"orig": seg.text, DEL: f"[-{seg.text}-]", INS: f"[+{seg.text}+]"}[seg.status]
+        out += {"orig": seg.text, DEL: f"[-{seg.text}-]", INS: f"[+{seg.text}+]", MOVED: f"[~{seg.text}~]"}[seg.status]
     return out
 
 
@@ -177,6 +179,468 @@ class ActNameTests(unittest.TestCase):
         self.assertGreater(new.order, find_doc(outcome, "16 U.S.C. § 824").order)
 
 
+class RedesignateTests(unittest.TestCase):
+    """S. 5653 § 2222(a)(1)(F): "by redesignating subsections (a) through (g) as paragraphs (8), (4), …,
+    respectively, and indenting and moving the paragraphs so as to appear in numerical order"."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>30</docNumber></meta><main>'
+            '<section identifier="/us/usc/t30/s1001"><num value="1001">§ 1001.</num><chapeau>In this chapter:'
+            '</chapeau><subsection><num value="a">(a)</num><content>“Secretary” means the Secretary.</content>'
+            '</subsection><subsection><num value="b">(b)</num><content>“lease” means a lease.</content>'
+            '</subsection><subsection><num value="c">(c)</num><content>“byproduct” means a mineral.</content>'
+            '</subsection><sourceCredit>(Pub. L. 91–581, § 2, Dec. 24, 1970.)</sourceCredit></section>'
+            '</main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum>{text}</paragraph>" for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>Section 2 of the Geothermal Steam Act of 1970 "
+                              f"(30 U.S.C. 1001) is amended—</text>{items}</section>")
+        outcome = apply_bill(bill, {30: CodeTitle(self.CODE)})
+        docs = [d for d in outcome.documents if d.title == "30 U.S.C. § 1001"]
+        return bill, outcome, docs[0].root if docs else None
+
+    def test_a_described_heading_is_the_term_the_paragraph_defines(self):  # S. 5653 § 2222(a)(1)(G)
+        bill, outcome, root = self.run_bill(
+            "<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), respectively;</text>",
+            "<text>in each of paragraphs (1) and (3)—</text><subparagraph><enum>(A)</enum><text>by inserting "
+            "<quote>The term</quote> after the paragraph designation; and</text></subparagraph><subparagraph>"
+            "<enum>(B)</enum><text>by inserting a paragraph heading, the text of which comprises the term defined in "
+            "that paragraph;</text></subparagraph>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual(outcome.applied, 3)
+        self.assertEqual([marked(c.heading) for c in root.children], ["[+Secretary+]", "", "[+Byproduct+]"])
+        self.assertEqual(marked(root.children[2].body), "[+The term +]“byproduct” means a mineral.")
+        passed = verify(bill, outcome)
+        self.assertFalse([f for f in outcome.flags if f.blocking])
+        self.assertIn("All inserted text appears verbatim in the bill, except headings the bill describes rather "
+                      "than quotes, which match the terms their provisions define.", passed)
+        self.assertEqual(sum("isn't quoted in the bill" in f.message for f in outcome.flags), 2)
+
+    def test_a_described_heading_that_no_longer_matches_fails_verification(self):
+        bill, outcome, root = self.run_bill(
+            "<text>in subsection (c), by inserting a subsection heading, the text of which comprises the term "
+            "defined in that subsection.</text>")
+        self.assertEqual(outcome.applied, 1)
+        root.children[2].body = Text("Something else.")
+        passed = verify(bill, outcome)
+        self.assertTrue(any("isn't a term its provision defines" in f.message for f in outcome.flags))
+        self.assertFalse(any(p.startswith("All inserted text") for p in passed))
+
+    def test_redesignated_subdivisions_take_the_new_kind(self):
+        bill, outcome, root = self.run_bill(
+            "<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), respectively, and "
+            "indenting appropriately;</text>",
+            "<text>by inserting after paragraph (2) the following:</text><quoted-block><paragraph><enum>(2A)</enum>"
+            "<text>“mineral” means a mineral.</text></paragraph></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (2, []))
+        self.assertEqual([(c.kind, c.value) for c in root.children],
+                         [("paragraph", "1"), ("paragraph", "2"), ("paragraph", "2A"), ("paragraph", "3")])
+
+    def test_moving_into_numerical_order_marks_the_fewest_provisions_moved(self):
+        bill, outcome, root = self.run_bill(
+            "<text>by redesignating subsections (a) through (c) as paragraphs (3), (1), and (2), respectively, and "
+            "indenting and moving the paragraphs so as to appear in numerical order.</text>")
+        self.assertTrue(bill.instructions[0].args["reorder"])
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        self.assertEqual([c.value for c in root.children], ["1", "2", "3"])
+        # (1) and (2) were already in order; only (3), the former (a), moved.
+        self.assertEqual([any(seg.status == MOVED for seg in c.body.segments) for c in root.children],
+                         [False, False, True])
+        self.assertEqual(marked(root.children[2].label), "[-(a)-][+(3)+]")
+        self.assertEqual(root.before_text(), "§ 1001.In this chapter:(a)“Secretary” means the Secretary.(b)“lease” means a "
+                                                     "lease.(c)“byproduct” means a mineral.")
+        self.assertIn("Original text in the redline matches the source XML in every section.", verify(bill, outcome))
+
+    def test_moved_text_is_purple_and_double_underlined(self):
+        bill, outcome, _ = self.run_bill(
+            "<text>by redesignating subsections (a) and (b) as paragraphs (2) and (1), respectively, and moving the "
+            "paragraphs so as to appear in numerical order.</text>")
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "ih", verify(bill, outcome))
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        moved = '<w:rPr><w:color w:val="7030A0"/><w:u w:val="double"/></w:rPr><w:t xml:space="preserve">'
+        # Swapping two, the first stays and the second, (1), the former (b), is marked as moved before it.
+        self.assertIn(moved + "“lease” means a lease.</w:t>", document)
+        self.assertIn(moved + "moved text</w:t>", document)  # the key
+        # Its old place, after (a) and before (c), with the old designation, as a subsection, purple and
+        # double-struck.
+        was = '<w:color w:val="7030A0"/></w:rPr><w:t xml:space="preserve">'
+        old_place = ('<w:p><w:r><w:rPr><w:b/><w:dstrike/>' + was + '(b)</w:t></w:r>'
+                     '<w:r><w:t xml:space="preserve"> </w:t></w:r><w:r><w:rPr><w:dstrike/>' + was +
+                     '“lease” means a lease.</w:t></w:r>')
+        self.assertIn(old_place, document)
+        paragraphs = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<w:p>.*?</w:p>", document)]
+        start = paragraphs.index("§ 1001. In this chapter:")
+        self.assertEqual(paragraphs[start + 1:start + 5], [
+            "(b)(1) “lease” means a lease.", "(a)(2) “Secretary” means the Secretary.", "(b) “lease” means a lease.",
+            "(c) “byproduct” means a mineral."])
+        self.assertIn('<w:dstrike/><w:color w:val="7030A0"/></w:rPr><w:t xml:space="preserve">where it was', document)
+
+    def test_moving_subdivisions_already_in_order_needs_no_flag(self):
+        _, outcome, _ = self.run_bill(
+            "<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), respectively, and "
+            "indenting and moving the paragraphs so as to appear in numerical order.</text>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+
+    def test_the_old_place_reads_as_it_was_when_the_bill_also_split_the_text(self):
+        # As in 42 U.S.C. 4336(b)(2): the bill splits the text into a new subparagraph (A), then moves the
+        # provision. Where it was, the text ran on in one line, so the old place shows it that way.
+        bill, outcome, root = self.run_bill(
+            "<text>in subsection (a), by striking <quote>“Secretary” means</quote> and inserting the following:"
+            "</text><quoted-block><subparagraph><enum>(A)</enum><header>In general</header><text>The term "
+            "<term>Secretary</term> means</text></subparagraph></quoted-block>",
+            "<text>by redesignating subsections (a) through (c) as paragraphs (3), (1), and (2), respectively, and "
+            "moving the paragraphs so as to appear in numerical order.</text>")
+        self.assertEqual((outcome.applied, outcome.flags), (2, []))
+        moved = root.children[2]
+        self.assertEqual((moved.value, moved.moved_by), ("3", "§ 2(2)"))
+        self.assertEqual(marked(moved.children[0].body), "[+The term “Secretary” means+][~ the Secretary.~]")
+        passed = verify(bill, outcome)
+        self.assertIn("Original text in the redline matches the source XML in every section.", passed)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "ih", passed)
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        paragraphs = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<w:p>.*?</w:p>", document)]
+        start = paragraphs.index("§ 1001. In this chapter:")
+        self.assertEqual(paragraphs[start + 1:start + 6], [
+            "(a) “Secretary” means the Secretary.",  # the old place, in one line
+            "(b)(1) “lease” means a lease.",
+            "(c)(2) “byproduct” means a mineral.",
+            "(a)(3) “Secretary” means",
+            "(A) In general The term “Secretary” means the Secretary."])
+        old_place = next(p for p in re.findall(r"<w:p>.*?</w:p>", document)
+                         if re.sub(r"<[^>]+>", "", p) == paragraphs[start + 1])
+        texts = re.findall(r"<w:r>(.*?)</w:r>", old_place)
+        self.assertTrue(all("<w:dstrike/>" in t for t in texts if re.sub(r"<[^>]+>", "", t).strip()))
+
+    def test_a_separate_instruction_to_reorder(self):
+        _, outcome, root = self.run_bill(
+            "<text>by redesignating subsections (a) and (b) as subsections (b) and (a), respectively;</text>",
+            "<text>by moving the subsections so as to appear in numerical order.</text>")
+        self.assertEqual((outcome.applied, outcome.failed), (2, 0))
+        self.assertEqual([c.value for c in root.children], ["a", "b", "c"])
+
+    def test_other_words_after_the_designations_arent_swallowed(self):
+        bill, _, _ = self.run_bill("<text>by redesignating subsections (a) through (c) as paragraphs (1) through (3), "
+                                   "respectively, and striking the definitions.</text>")
+        self.assertEqual([p.reason for p in bill.problems], ["instruction wording isn't a recognized pattern"])
+
+
+class MoreShapesTests(unittest.TestCase):
+    """S. 5653 §§ 1205(1), 1302(2)(D)(ii), 2232 and 2222(a)(1)(G)(i)."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s1536"><num value="1536">§ 1536.</num>'
+            '<subsection><num value="b">(b)</num><paragraph><num value="1">(1)</num>'
+            '<subparagraph><num value="A">(A)</num><content>Consultation shall end.</content></subparagraph>'
+            '<subparagraph><num value="B">(B)</num><chapeau>The Secretary may not agree—</chapeau>'
+            '<clause><num value="i">(i)</num><content>first;</content></clause>'
+            '<clause><num value="ii">(ii)</num><content>second,</content></clause>'
+            '<continuation>unless the applicant consents. The Secretary may extend the period.</continuation>'
+            '</subparagraph></paragraph></subsection>'
+            '<subsection><num value="e">(e)</num><content>Licenses within any reservation shall protect the use '
+            'of such reservation: Provided, That the Secretary shall deem the use of such reservation necessary: '
+            'Provided further, That no license shall affect the use of such reservation.</content></subsection>'
+            '<subsection><num value="f">(f)</num><chapeau>In this section:</chapeau>'
+            '<paragraph><num value="1">(1)</num><content>“Secretary” means the Secretary.</content></paragraph>'
+            '<paragraph><num value="2">(2)</num><content>“lease” means a lease.</content></paragraph></subsection>'
+            '<subsection><num value="n">(n)</num><content>Any person, as defined by section 3(1), may seek review in '
+            'the court for (1) any circuit where the action occurs, or (2) the District of Columbia, within 90 days.'
+            '</content></subsection>'
+            '<subsection><num value="t">(t)</num><heading>Navigable waters</heading><content>Nothing in this '
+            'section shall preclude a State.</content></subsection>'
+            '<sourceCredit>(Pub. L. 93–205, § 7, Dec. 28, 1973.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum>{text}</paragraph>" for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>Section 7 of the Endangered Species Act of 1973 "
+                              f"(16 U.S.C. 1536) is amended—</text>{items}</section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        self.assertIn("Original text in the redline matches the source XML in every section.", verify(bill, outcome))
+        docs = [d for d in outcome.documents if d.title == "16 U.S.C. § 1536"]
+        return outcome, docs[0].root if docs else None
+
+    def test_matter_after_the_last_subdivision_becomes_a_new_provision_after_it(self):
+        outcome, root = self.run_bill(
+            "<text>in subsection (b)(1)(B), in the undesignated matter following clause (ii), by striking "
+            "<quote>The Secretary may extend</quote> and inserting the following:</text><quoted-block><subparagraph>"
+            "<enum>(C)</enum><text>The Secretary may extend</text></subparagraph></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        paragraph = root.live_child("b").live_child("1")
+        self.assertEqual([c.value for c in paragraph.children], ["A", "B", "C"])
+        subparagraph_b, subparagraph_c = paragraph.children[1:]
+        self.assertEqual([c.value for c in subparagraph_b.children], ["i", "ii"])  # the clauses stay
+        self.assertEqual(marked(subparagraph_b.tail), "unless the applicant consents. [-The Secretary may extend-]")
+        self.assertEqual(marked(subparagraph_c.body), "[+The Secretary may extend+] the period.")
+
+    def test_matter_after_subdivisions_cant_become_a_deeper_provision(self):
+        outcome, _ = self.run_bill(
+            "<text>in subsection (b)(1)(B), in the undesignated matter following clause (ii), by striking "
+            "<quote>The Secretary may extend</quote> and inserting the following:</text><quoted-block><clause>"
+            "<enum>(iii)</enum><text>The Secretary may extend</text></clause></quoted-block>")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("only the matter after the last subdivision", outcome.flags[0].message)
+
+    def test_an_edit_in_a_proviso_stays_in_it(self):
+        # "of such reservation" appears in the text before the provisos, in the first and in the second.
+        outcome, root = self.run_bill("<text>in subsection (e), in the first proviso, by inserting <quote>and are "
+                                      "reasonable</quote> after <quote>of such reservation</quote>.</text>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        self.assertEqual(marked(root.live_child("e").body),
+                         "Licenses within any reservation shall protect the use of such reservation: Provided, That "
+                         "the Secretary shall deem the use of such reservation[+ and are reasonable+] necessary: "
+                         "Provided further, That no license shall affect the use of such reservation.")
+
+    def test_a_missing_proviso_isnt_guessed(self):
+        outcome, _ = self.run_bill("<text>in subsection (e), in the third proviso, by inserting <quote>X</quote> "
+                                   "after <quote>of such reservation</quote>.</text>")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("doesn't have a third proviso (it has 2)", outcome.flags[0].message)
+
+    def test_a_struck_designation_gives_way_to_the_new_one(self):
+        outcome, root = self.run_bill(
+            "<text>in subsection (t), by striking <quote>(t) Nothing in this section</quote> and inserting the "
+            "following:</text><quoted-block><subsection><enum>(u)</enum><header>Savings provision</header><text>"
+            "Nothing in this section</text></subsection></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        subsection = root.live_child("u")
+        self.assertEqual((marked(subsection.label), marked(subsection.heading), marked(subsection.body)),
+                         ("[-(t)-][+(u)+]", "[-Navigable waters-][+Savings provision+]",
+                          "Nothing in this section shall preclude a State."))
+        self.assertIsNone(root.live_child("t"))
+
+    def test_designations_run_into_the_text_are_redesignated_there(self):
+        # 16 U.S.C. 1536(n) runs "(1) any circuit …, or (2) …" into its text. The "(1)" in "section 3(1)" is a
+        # citation, not a designation.
+        outcome, root = self.run_bill("<text>in subsection (n), by redesignating paragraphs (1) and (2) as "
+                                      "subparagraphs (A) and (B), respectively.</text>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual(marked(root.live_child("n").body),
+                         "Any person, as defined by section 3(1), may seek review in the court for [-(1)-][+(A)+] any "
+                         "circuit where the action occurs, or [-(2)-][+(B)+] the District of Columbia, within 90 days.")
+        self.assertEqual([f.blocking for f in outcome.flags], [False])
+        self.assertIn("runs paragraphs (1) and (2) into the text of", outcome.flags[0].message)
+
+    def test_run_in_designations_out_of_order_or_missing_arent_guessed(self):
+        for values in ("(2) and (1) as subparagraphs (A) and (B)", "(1) and (3) as subparagraphs (A) and (B)"):
+            outcome, _ = self.run_bill(f"<text>in subsection (n), by redesignating paragraphs {values}, "
+                                       "respectively.</text>")
+            self.assertEqual(outcome.applied, 0, values)
+            self.assertIn("wasn't found", outcome.flags[0].message)
+
+    def test_text_inserted_after_a_designation(self):
+        outcome, root = self.run_bill("<text>in subsection (f), in each of paragraphs (1) and (2), by inserting "
+                                      "<quote>The term</quote> after the paragraph designation.</text>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        self.assertEqual([marked(c.body) for c in root.live_child("f").children],
+                         ["[+The term +]“Secretary” means the Secretary.", "[+The term +]“lease” means a lease."])
+
+    def test_text_after_a_designation_must_name_the_right_level(self):
+        outcome, _ = self.run_bill("<text>in subsection (f)(1), by inserting <quote>The term</quote> after the "
+                                   "subsection designation.</text>")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("isn't a subsection with text after its designation", outcome.flags[0].message)
+
+
+class SpanAcrossTests(unittest.TestCase):
+    """S. 5653 §§ 2101(b)(2)(B)(ii) and 2101(g)(2)(C): spans from the matter preceding the first subdivision
+    into a later one."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s824p"><num value="824p">§ 824p.</num>'
+            '<subsection><num value="c">(c)</num><chapeau>The State has not acted by 1 year after the later of—'
+            '</chapeau><paragraph><num value="1">(1)</num><content>the date filed; and</content></paragraph>'
+            '<paragraph><num value="2">(2)</num><content>the date designated;</content></paragraph></subsection>'
+            '<subsection><num value="d">(d)</num><chapeau>The States are in disagreement after the later of—'
+            '</chapeau><subparagraph><num value="A">(A)</num><content>the date that is 1 year after filing; and'
+            '</content></subparagraph><subparagraph><num value="B">(B)</num><content>the date of designation.'
+            '</content></subparagraph></subsection>'
+            '<sourceCredit>(June 10, 1920, ch. 285, pt. II, § 216.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, instruction):
+        bill = parse_sections("<section><enum>2.</enum><text>Section 216 of the Federal Power Act (16 U.S.C. 824p) "
+                              f"is amended {instruction}</text></section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        self.assertIn("Original text in the redline matches the source XML in every section.", verify(bill, outcome))
+        docs = [d for d in outcome.documents if d.title == "16 U.S.C. § 824p"]
+        return bill, outcome, docs[0].root if docs else None
+
+    def test_through_the_punctuation_at_the_end_of_the_last_subdivision(self):
+        _, outcome, root = self.run_bill(
+            "in subsection (c), by striking <quote>the later of</quote> in the matter preceding paragraph (1) and all "
+            "that follows through the semicolon at the end of paragraph (2) and inserting <quote>the date filed "
+            "with the State;</quote>.")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        subsection = root.live_child("c")
+        self.assertEqual(marked(subsection.body), "The State has not acted by 1 year after [-the later of—-][+the date "
+                                                  "filed with the State;+]")
+        self.assertTrue(all(c.deleted for c in subsection.children))
+
+    def test_through_a_designation_and_the_words_after_it(self):
+        bill, outcome, root = self.run_bill(
+            "in subsection (d), by striking <quote>in disagreement</quote> in the matter preceding subparagraph (A) "
+            "and all that follows through <quote>(A) the</quote> in subparagraph (A) and inserting <quote>unable to "
+            "agree by the</quote>.")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        subsection = root.live_child("d")
+        first, second = subsection.children
+        self.assertEqual(marked(subsection.body), "The States are [-in disagreement after the later of—-][+unable to "
+                                                  "agree by the+]")
+        self.assertEqual((marked(first.label), marked(first.body), first.run_in),
+                         ("[-(A)-]", "[-the-] date that is 1 year after filing; and", True))
+        self.assertFalse(second.deleted)
+        # In the document, what's left of (A) finishes the sentence on the same line.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "ih", verify(bill, outcome))
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        paragraphs = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<w:p>.*?</w:p>", document)]
+        self.assertIn("(d) The States are in disagreement after the later of—unable to agree by the (A) the date that "
+                      "is 1 year after filing; and", paragraphs)
+        self.assertIn("(B) the date of designation.", paragraphs)
+
+    def test_the_start_must_be_before_the_first_subdivision(self):
+        _, outcome, _ = self.run_bill(
+            "in subsection (d), by striking <quote>in disagreement</quote> in the matter preceding subparagraph (B) "
+            "and all that follows through <quote>(B) the</quote> in subparagraph (B).")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("subparagraph (B) isn't the first subdivision", outcome.flags[0].message)
+
+    def test_an_end_that_isnt_there_isnt_guessed(self):
+        _, outcome, _ = self.run_bill(
+            "in subsection (d), by striking <quote>in disagreement</quote> in the matter preceding subparagraph (A) "
+            "and all that follows through <quote>nowhere</quote> in subparagraph (B).")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("“nowhere” wasn't found exactly once", outcome.flags[0].message)
+
+
+class StatutesAtLargeTests(unittest.TestCase):
+    """S. 5653 § 2212: "The Act of February 5, 1948 (62 Stat. 17, chapter 45), is amended— (1) in the first
+    section (62 Stat. 17, chapter 45; 25 U.S.C. 323), …"."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>25</docNumber></meta><main>'
+            '<section identifier="/us/usc/t25/s323"><num value="323">§ 323.</num><heading>Rights-of-way across any '
+            'Indian lands</heading><content>The Secretary of the Interior be, and he is empowered to grant '
+            'rights-of-way.</content><sourceCredit>(Feb. 5, 1948, ch. 45, § 1, 62 Stat. 17.)</sourceCredit></section>'
+            '<section identifier="/us/usc/t25/s324"><num value="324">§ 324.</num><content>No grant over lands of a '
+            'tribe organized under the Act of June 18, 1934 (48 Stat. 984), as amended [25 U.S.C. 5101 et seq.], '
+            'shall be made without consent.</content><sourceCredit>(Feb. 5, 1948, ch. 45, § 2, 62 Stat. 18.)'
+            '</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum>{text}</paragraph>" for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>The Act of February 5, 1948 (62 Stat. 17, chapter 45), "
+                              f"is amended—</text>{items}</section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {25: CodeTitle(self.CODE)})
+        self.assertIn("Original text in the redline matches the source XML in every section.", verify(bill, outcome))
+        return bill, outcome
+
+    def test_each_instruction_gives_the_code_citation(self):
+        bill, outcome = self.run_bill(
+            "<text>in the first section (62 Stat. 17, chapter 45; 25 U.S.C. 323), by striking <quote>That the "
+            "Secretary of the Interior be, and he is hereby, empowered to</quote> and inserting the following:"
+            "</text><quoted-block><section><enum>1.</enum><header>Rights-of-way across Indian land</header>"
+            "<subsection><enum /><text>The Secretary of the Interior may</text></subsection></section>"
+            "</quoted-block>",
+            "<text>in section 2 (62 Stat. 18, chapter 45; 25 U.S.C. 324), by striking <quote>organized under the Act "
+            "of June 18, 1934 (48 Stat. 984), as amended,</quote>.</text>",
+            "<text>by adding at the end the following:</text><quoted-block><section><enum>8.</enum><header>Tribal "
+            "grants</header><text>A tribe may grant a right-of-way.</text></section></quoted-block>")
+        self.assertEqual(bill.titles(), [25])
+        self.assertEqual([(i.target.section, i.target.usc_section) for i in bill.instructions],
+                         [("1", "323"), ("2", "324"), (None, None)])
+        self.assertEqual((outcome.applied, outcome.failed), (3, 0))
+        first = find_doc(outcome, "25 U.S.C. § 323").root
+        self.assertEqual(marked(first.heading),
+                         "[-Rights-of-way across any Indian lands-][+Rights-of-way across Indian land+]")
+        self.assertEqual(marked(first.body), "[-The Secretary of the Interior be, and he is empowered to-][+The "
+                                             "Secretary of the Interior may+] grant rights-of-way.")
+        self.assertEqual(marked(find_doc(outcome, "25 U.S.C. § 324").root.body),
+                         "No grant over lands of a tribe[- organized under the Act of June 18, 1934 (48 Stat. 984), as "
+                         "amended [25 U.S.C. 5101 et seq.],-] shall be made without consent.")
+        find_doc(outcome, "New § 8 of the Act of February 5, 1948 (no Code section number yet)")
+        self.assertEqual([f.blocking for f in outcome.flags], [False, False])  # the two reworded matches
+
+    def test_without_a_code_citation_the_act_isnt_found(self):
+        _, outcome = self.run_bill("<text>in section 2, by striking <quote>without consent</quote>.</text>")
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("couldn't be mapped to Code sections", outcome.flags[0].message)
+
+    def test_the_enacting_that_is_optional_only_at_the_start(self):
+        pattern = _code_wording("That the Secretary", {})
+        self.assertRegex("The Secretary", pattern)
+        self.assertRegex("That the Secretary", pattern)
+        self.assertIsNone(_code_wording("provided That the Secretary", {}))
+
+
+class CodeWordingTests(unittest.TestCase):
+    """The Code's editors reword an Act's text: its own section numbers for the Act's, "this chapter" for
+    "this Act", dates for "the date of enactment", curly apostrophes. A phrase quoted from the Act is matched
+    against those forms when it isn't found as is."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s1532"><num value="1532">§ 1532.</num><content>Definitions.</content>'
+            '<sourceCredit>(Pub. L. 93–205, § 3, Dec. 28, 1973.)</sourceCredit></section>'
+            '<section identifier="/us/usc/t16/s1536"><num value="1536">§ 1536.</num><content>Any person, as defined '
+            'by section 1532(13) of this title, may obtain review under sections 1532 and 1533 of this title. '
+            'The agency’s rules are due 18 months after December 28, 1973. The agency’s staff shall assist.'
+            '</content><sourceCredit>(Pub. L. 93–205, § 7, Dec. 28, 1973.)</sourceCredit></section>'
+            '<section identifier="/us/usc/t16/s1533"><num value="1533">§ 1533.</num><content>Listing.</content>'
+            '<sourceCredit>(Pub. L. 93–205, § 4, Dec. 28, 1973.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum><text>{text}</text></paragraph>"
+                        for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>Section 7 of the Endangered Species Act of 1973 "
+                              f"(16 U.S.C. 1536) is amended—</text>{items}</section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        docs = [d for d in outcome.documents if d.title == "16 U.S.C. § 1536"]
+        return outcome, marked(docs[0].root.body) if docs else None
+
+    def test_patterns_allow_the_codes_forms_and_leave_plain_phrases_alone(self):
+        self.assertIsNone(_code_wording("may obtain review", {"3": "1532"}))
+        pattern = _code_wording("section 3(13) of this Act,", {"3": "1532"})
+        self.assertRegex("section 1532(13) of this title,", pattern)
+        self.assertRegex("section 3(13) of this Act,", pattern)
+        self.assertRegex("subchapter II of this chapter", _code_wording("title II of this Act", {}))
+        self.assertRegex("1342 of this title, and (G)", _code_wording("402, and (G)", {"402": "1342"}))
+        # At the end of a phrase, "of this title" isn't taken, so striking the phrase leaves it in place.
+        self.assertNotRegex("and 824v of this title", _code_wording("and 222", {"222": "824v"}) + "$")
+        self.assertRegex("the Federal Power Act [16 U.S.C. 824p(a)]",
+                         _code_wording("the Federal Power Act (16 U.S.C. 824p(a))", {}))
+        self.assertRegex("section 824p(a) of title 16",
+                         _code_wording("section 216(a) of the Federal Power Act (16 U.S.C. 824p(a))", {}))
+
+    def test_the_codes_wording_is_matched_and_noted_for_review(self):
+        outcome, body = self.run_bill(
+            "by striking <quote>Any person, as defined by section 3(13) of this Act,</quote> and inserting "
+            "<quote>Any person</quote>;",
+            "by striking <quote>sections 3 and 4</quote> and inserting <quote>sections 3, 4, and 5</quote>;",
+            "by striking <quote>18 months after the date of enactment of this section</quote> and inserting "
+            "<quote>1 year after the date of enactment of the Recovery Act</quote>.")
+        self.assertEqual((outcome.applied, outcome.failed), (3, 0))
+        self.assertEqual(body, "[-Any person, as defined by section 1532(13) of this title,-][+Any person+] may "
+                               "obtain review under [-sections 1532 and 1533-][+sections 3, 4, and 5+] of this "
+                               "title. The agency’s rules are due [-18 months after December 28, 1973-][+1 year "
+                               "after the date of enactment of the Recovery Act+]. The agency’s staff shall assist.")
+        self.assertEqual([f.blocking for f in outcome.flags], [False, False, False])
+        self.assertIn("The Code prints “sections 1532 and 1533” where the bill quotes the Act's “sections 3 and 4”",
+                      outcome.flags[1].message)
+
+    def test_a_reworded_match_that_isnt_unique_isnt_applied(self):
+        outcome, body = self.run_bill("by striking <quote>agency's</quote> and inserting <quote>agency</quote>.")
+        self.assertEqual((outcome.applied, outcome.failed), (0, 1))
+        self.assertIsNone(body)
+        self.assertIn("wasn't found", outcome.flags[0].message)
+
+    def test_a_review_note_is_dropped_when_the_instruction_then_fails(self):
+        outcome, _ = self.run_bill("by striking <quote>section 3(13) of this Act</quote> and all that follows "
+                                   "through <quote>nowhere</quote> and inserting <quote>X</quote>.")
+        self.assertEqual(outcome.applied, 0)
+        self.assertEqual([f.blocking for f in outcome.flags], [True])
+
+
 class LeadInTests(unittest.TestCase):
     def target(self, lead):
         bill = parse_sections(f"<section><enum>2.</enum><text>{lead} by striking <quote>a</quote> and inserting "
@@ -209,6 +673,58 @@ class LeadInTests(unittest.TestCase):
         target = self.target("Chapter 3027 of title 54, United States Code, is amended")
         self.assertEqual((target.title, target.chapter), (54, "3027"))
 
+    def test_code_chapter_table_of_sections(self):
+        target = self.target("The table of sections for chapter 3027 of title 54, United States Code, is amended")
+        self.assertEqual((target.title, target.chapter, target.toc), (54, "3027", True))
+
+
+class TableOfSectionsTests(unittest.TestCase):
+    """S. 5653 § 2301(b)(2)(A) adds 54 U.S.C. 302707, and (b)(4) adds it to the chapter's table of sections."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>54</docNumber></meta><main>'
+            '<chapter identifier="/us/usc/t54/stIII/dA/sd2/ch3027"><num value="3027">CHAPTER 3027—</num>'
+            '<heading>PROGRAMS FOR INDIAN TRIBES</heading><toc><layout><header role="tocColumnHeader"><column>Sec.'
+            '</column></header><tocItem><column><ref href="/us/usc/t54/s302701">302701.</ref></column><column>'
+            'Program to assist Indian tribes.</column></tocItem><tocItem><column><ref href="/us/usc/t54/s302702">'
+            '302702.</ref></column><column>Indian tribe to assume functions.</column></tocItem></layout></toc>'
+            '<section identifier="/us/usc/t54/s302701"><num value="302701">§ 302701.</num><heading>Program</heading>'
+            '<content>The Secretary shall assist.</content></section>'
+            '<section identifier="/us/usc/t54/s302702"><num value="302702">§ 302702.</num><heading>Functions'
+            '</heading><content>A tribe may assume functions.</content></section></chapter></main></uscDoc>').encode()
+
+    def run_bill(self, entry, section="302707"):
+        bill = parse_sections(
+            '<section><enum>2.</enum><text>Chapter 3027 of title 54, United States Code, is amended by adding at '
+            f'the end the following:</text><quoted-block><section id="s1"><enum>{section}.</enum><header>Program '
+            'evaluation</header><text>The Secretary shall evaluate.</text></section></quoted-block></section>'
+            '<section><enum>3.</enum><text>The table of sections for chapter 3027 of title 54, United States Code, '
+            'is amended by adding at the end the following:</text><quoted-block><toc><toc-entry level="section" '
+            f'idref="s1">{entry}</toc-entry></toc><after-quoted-block>.</after-quoted-block></quoted-block>'
+            '</section>')
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {54: CodeTitle(self.CODE)})
+        passed = verify(bill, outcome)
+        docs = {d.title: d for d in outcome.documents}
+        return outcome, passed, docs
+
+    def test_an_entry_is_added_at_the_end_of_the_table(self):
+        outcome, passed, docs = self.run_bill("302707. Program evaluation.")
+        self.assertEqual((outcome.applied, outcome.flags), (2, []))
+        self.assertEqual(list(docs), ["54 U.S.C. chapter 3027, table of sections", "New 54 U.S.C. § 302707"])
+        entries = docs["54 U.S.C. chapter 3027, table of sections"].root.children
+        self.assertEqual([(marked(e.label), marked(e.body)) for e in entries], [
+            ("302701.", "Program to assist Indian tribes."), ("302702.", "Indian tribe to assume functions."),
+            ("[+302707.+]", "[+Program evaluation.+]")])
+        self.assertIn("Original text in the redline matches the source XML in every section.", passed)
+        self.assertTrue(any(p.startswith("All inserted text appears verbatim in the bill") for p in passed))
+
+    def test_an_entry_that_doesnt_match_the_new_section_is_flagged(self):
+        outcome, _, _ = self.run_bill("302707. Program review.")
+        self.assertEqual(outcome.applied, 2)
+        self.assertTrue(any("new section's heading is “Program evaluation”" in f.message for f in outcome.flags))
+        # The new section is added as § 302703, the next free number, so the entry for § 302702 isn't for it.
+        outcome, _, _ = self.run_bill("302702. Program evaluation.", section="302702")
+        self.assertTrue(any("already lists § 302702" in f.message for f in outcome.flags))
+
 
 class WholeSectionTests(unittest.TestCase):
     CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>42</docNumber></meta><main>'
@@ -239,6 +755,41 @@ class WholeSectionTests(unittest.TestCase):
         new = find_doc(outcome, "New 42 U.S.C. § 4348")
         self.assertEqual(new.root.label.current(), "§ 4348.")
         self.assertGreater(new.order, CodeTitle(self.CODE).document("4347").order)
+
+    def test_a_new_section_whose_number_is_taken_gets_the_next_free_one(self):
+        # As in S. 5653 § 2234, which adds a § 37 to the Federal Power Act when it already has one. Here § 209
+        # exists, so the new 209 becomes 210, and the new 210 after it becomes 211.
+        outcome = self.run_bill(
+            "<section><enum>2.</enum><text>Title II of the National Environmental Policy Act of 1969 (42 U.S.C. 4346 "
+            "et seq.) is amended by adding at the end the following:</text><quoted-block><section><enum>209.</enum>"
+            "<header>First</header>"
+            "<text>One.</text></section><section><enum>210.</enum><header>Second</header><text>Two.</text>"
+            "</section></quoted-block></section>")
+        self.assertEqual(outcome.applied, 1)
+        first = find_doc(outcome, "New § 210 of Pub. L. 91-190 (no Code section number yet)")
+        second = find_doc(outcome, "New § 211 of Pub. L. 91-190 (no Code section number yet)")
+        self.assertEqual((marked(first.root.label), marked(first.root.heading)), ("[+Sec. 210.+]", "[+First+]"))
+        self.assertEqual(marked(second.root.label), "[+Sec. 211.+]")
+        self.assertEqual([f.blocking for f in outcome.flags], [False, False])
+        self.assertEqual(outcome.flags[0].message,
+                         "Act § 209 already exists (42 U.S.C. § 4347), so the new section is added as § 210, the next "
+                         "number not in use. Check the numbering, and any references to the new section as § 209.")
+        self.assertIn("Act § 210 already exists", outcome.flags[1].message)
+
+    def test_a_new_code_section_whose_number_is_taken_gets_the_next_free_one(self):
+        outcome = self.run_bill(
+            "<section><enum>2.</enum><text>Chapter 55 of title 42, United States Code, is amended by adding at the "
+            "end the following:</text><quoted-block><section><enum>4347.</enum><header>New</header><text>Text."
+            "</text></section></quoted-block></section>")
+        new = find_doc(outcome, "New 42 U.S.C. § 4348")
+        self.assertEqual(new.root.label.current(), "§ 4348.")
+        self.assertEqual([f.blocking for f in outcome.flags], [False])
+        self.assertIn("42 U.S.C. § 4347 already exists, so the new section is added as § 4348", outcome.flags[0].message)
+
+    def test_a_taken_number_with_no_clear_next_one_stays_flagged(self):
+        self.assertIsNone(_next_free("216A", lambda n: n == "216A"))
+        self.assertEqual(_next_free("37", lambda n: n in ("37", "38")), "39")
+        self.assertEqual(_next_free("37", lambda n: False), "37")
 
 
 class EachOfTests(unittest.TestCase):
@@ -281,6 +832,21 @@ class EachOfTests(unittest.TestCase):
         self.assertIsNone(texts)  # nothing changed, so the section isn't in the redline
         self.assertIn("none were changed", outcome.flags[-1].message)
 
+    def test_indenting_is_applied_without_marks_and_flagged_for_review(self):
+        for wording in ("by indenting paragraphs (1) through (3) appropriately.",
+                        "by moving the margins of paragraphs (1) through (3) 2 ems to the right."):
+            outcome, texts = self.run_bill(wording)
+            self.assertEqual((outcome.applied, outcome.failed), (1, 0))
+            self.assertIsNone(texts)  # no words changed
+            self.assertEqual([f.blocking for f in outcome.flags], [False])
+            self.assertIn("Indentation only: the instruction moves paragraphs (1) through (3)",
+                          outcome.flags[0].message)
+
+    def test_indenting_a_missing_subdivision_isnt_applied(self):
+        outcome, _ = self.run_bill("by indenting paragraphs (1) through (4) appropriately.")
+        self.assertEqual((outcome.applied, outcome.failed), (0, 1))
+        self.assertIn("paragraph (4) wasn't found", outcome.flags[0].message)
+
     def test_near_misses_are_checked_only_where_the_replacement_reached(self):
         outcome, texts = self.run_bill("in each of paragraphs (1) and (2), by striking <quote>Secretary</quote> "
                                        "each place it appears and inserting <quote>Commission</quote>.")
@@ -321,6 +887,66 @@ class NoteLookupTests(unittest.TestCase):
     def test_without_the_public_law_an_unnamed_note_is_still_flagged(self):
         target, outcome = self.run_bill("42 U.S.C. 3211 note")
         self.assertIsNone(target.public_law)
+        self.assertEqual(outcome.applied, 0)
+        self.assertIn("wasn't found in the Code notes", outcome.flags[0].message)
+
+    def test_an_act_cited_by_public_law_takes_its_section_and_code_cite_from_each_instruction(self):
+        # "The … Act (Public Law 118–159) is amended— (A) in section 1412(b)(2) (50 U.S.C. 98b note), by …"
+        code = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>50</docNumber></meta><main>'
+                '<section identifier="/us/usc/t50/s98b"><num value="98b">§ 98b.</num><content>Text.</content>'
+                '<sourceCredit>(Pub. L. 79–520, § 3.)</sourceCredit><notes><note topic="miscellaneous">'
+                '<heading>Stockpile</heading><p>Pub. L. 118–159, div. A, title XIV, § 1412, provided that:'
+                '<quotedContent origin="/us/pl/118/159/dA/tXIV/s1412"><subsection><num value="b">“(b)</num>'
+                '<heading> Review.—</heading><paragraph><num value="2">(2)</num><content>Exclusions under section 111 '
+                'of the National Environmental Policy Act of 1969 (42 U.S.C. 4336e) apply.</content></paragraph>'
+                '</subsection></quotedContent></p></note></notes></section></main></uscDoc>').encode()
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>The Servicemember Quality of Life Improvement and National Defense "
+            "Authorization Act for Fiscal Year 2025 (Public Law 118–159) is amended—</text><paragraph>"
+            "<enum>(1)</enum><text>in section 1412(b)(2) (50 U.S.C. 98b note), by striking <quote>section 111 of the "
+            "National Environmental Policy Act of 1969 (42 U.S.C. 4336e)</quote> and inserting <quote>section 3 of "
+            "the National Environmental Policy Act of 1969</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        target = bill.instructions[0].target
+        self.assertEqual((target.section, target.path, target.title, target.usc_section, target.is_note),
+                         ("1412", [("subsection", "b"), ("paragraph", "2")], 50, "98b", True))
+        self.assertEqual(bill.titles(), [50])
+        outcome = apply_bill(bill, {50: CodeTitle(code)})
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        doc = find_doc(outcome, "50 U.S.C. § 98b note (Pub. L. 118-159, § 1412)")
+        self.assertIn("[+section 3 of the National Environmental Policy Act of 1969+]",
+                      marked(doc.root.children[0].children[0].body))
+
+    # The Code reproduces only subsection (c) of Pub. L. 118–159 § 3511, in a note to 46 U.S.C. 50505.
+    PART_CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>46</docNumber></meta><main>'
+                 '<section identifier="/us/usc/t46/s50505"><num value="50505">§ 50505.</num><content>Text.</content>'
+                 '<sourceCredit>(Pub. L. 109–304, § 8.)</sourceCredit><notes><note topic="miscellaneous">'
+                 '<heading>Categorical Exclusions</heading><p>Pub. L. 118–159, div. C, title XXXV, § 3511(c), provided '
+                 'that:<quotedContent origin="/us/pl/118/159/dC/tXXXV/s3511/c"><paragraph><num value="3">“(3)</num>'
+                 '<heading> Definitions.—</heading><subparagraph><num value="A">“(A)</num><content> The term '
+                 '“categorical exclusion” has the meaning given in section 111 of the National Environmental Policy '
+                 'Act of 1969 (42 U.S.C. 4336e).</content></subparagraph></paragraph></quotedContent></p></note>'
+                 '</notes></section></main></uscDoc>').encode()
+
+    def run_part(self, locator):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>The Servicemember Quality of Life Improvement and National Defense "
+            "Authorization Act for Fiscal Year 2025 (Public Law 118–159) is amended—</text><paragraph>"
+            f"<enum>(1)</enum><text>in section {locator} (46 U.S.C. 50505 note), by striking <quote>section 111 of "
+            "the National Environmental Policy Act of 1969 (42 U.S.C. 4336e)</quote> and inserting <quote>section 3 "
+            "of the National Environmental Policy Act of 1969</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        return apply_bill(bill, {46: CodeTitle(self.PART_CODE)})
+
+    def test_a_note_of_part_of_a_section_is_found_from_the_path(self):
+        outcome = self.run_part("3511(c)(3)(A)")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        doc = find_doc(outcome, "46 U.S.C. § 50505 note (Pub. L. 118-159, § 3511(c))")
+        self.assertIn("[+section 3 of the National Environmental Policy Act of 1969+]",
+                      marked(doc.root.children[0].children[0].body))
+
+    def test_a_note_of_another_part_of_the_section_isnt_used(self):
+        outcome = self.run_part("3511(d)(3)(A)")
         self.assertEqual(outcome.applied, 0)
         self.assertIn("wasn't found in the Code notes", outcome.flags[0].message)
 
@@ -402,6 +1028,43 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(action("by striking <quote>A</quote> and all that follows through the period at the end "
                                 "and inserting <quote>B.</quote>."),
                          ("replace_span", {"start": "A", "end": None, "end_punct": ".", "new": "B."}))
+
+    def test_strike_through_and_insert_a_block(self):  # S. 5653 § 2215(c)(1)(A)
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 351) is amended, in the sixth "
+            "sentence, by striking <quote>The term</quote> and all that follows through <quote>embrace</quote> and "
+            "inserting the following:</text><quoted-block><paragraph><enum>(5)</enum><header>Oil</header><text>The "
+            "term <term>oil</term> means</text></paragraph><after-quoted-block>;</after-quoted-block></quoted-block>"
+            "</section>")
+        self.assertEqual(bill.problems, [])
+        (inst,) = bill.instructions
+        self.assertEqual((inst.action, inst.args["old"], inst.args["through"]),
+                         ("replace_with_block", "The term", "embrace"))
+        self.assertEqual(inst.within, [("sentence", 6)])
+
+    def test_insert_a_described_heading(self):  # S. 5653 § 2222(a)(1)(G)(ii)
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 1001) is amended, in paragraph (1), "
+            "by inserting a paragraph heading, the text of which comprises the term defined in that paragraph;"
+            "</text></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual((bill.instructions[0].action, bill.instructions[0].args),
+                         ("insert_term_heading", {"unit": "paragraph"}))
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 1001) is amended, in paragraph (1), "
+            "by inserting a paragraph heading, the text of which comprises the term defined in that subsection;"
+            "</text></section>")
+        self.assertEqual(len(bill.problems), 1)  # the levels must agree
+
+    def test_strike_a_sentence_and_insert_a_block(self):  # S. 5653 § 2215(c)(1)(C)
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 2 of the Foo Act (30 U.S.C. 351) is amended by striking the "
+            "fourth sentence and inserting the following:</text><quoted-block><paragraph><enum>(4)</enum><header>"
+            "Mineral leasing laws</header><text>The term <term>mineral leasing laws</term> means the Act.</text>"
+            "</paragraph><after-quoted-block>;</after-quoted-block></quoted-block></section>")
+        self.assertEqual(bill.problems, [])
+        (inst,) = bill.instructions
+        self.assertEqual((inst.action, inst.args["n"], len(inst.args["blocks"])), ("replace_sentence_with_block", 4, 1))
 
     def test_within_locators(self):
         bill = parse_sections(
@@ -581,6 +1244,140 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(marked(second.body), "[+The location fee+] is $5.")
         self.assertEqual(node.before_text(), "(b)The fee is due. The location fee is $5.")
 
+    def test_a_struck_span_gives_way_to_new_subdivisions(self):  # S. 5653 § 2215(c)(1)(A), 30 U.S.C. 351
+        node = Node("section", "351", label=Text("§ 351."),
+                    body=Text("The term Secretary means the Secretary. The term oil shall embrace all gases."))
+        doc = SimpleNamespace(title="Test", root=node)
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                           args={"old": "The term", "through": "embrace",
+                                 "blocks": [new_node("paragraph", "5", "Oil", "The term oil means")]},
+                           within=[("sentence", 2)])
+        Engine(SimpleNamespace(), {})._operate(inst, doc, node)
+        self.assertEqual(marked(node.body), "The term Secretary means the Secretary. [-The term oil shall embrace-]")
+        self.assertEqual(marked(node.children[0].body), "[+The term oil means+] all gases.")
+
+    def test_a_sentence_the_code_joins_to_another_is_found_by_its_text(self):
+        # The Code has a sentence fewer than the bill counts, and nothing shows where it joined two.
+        node = Node("section", "351", label=Text("§ 351."), body=Text(
+            "The fee is due, and the Secretary sets it. The term “oil” shall embrace all hydrocarbons."))
+        doc = SimpleNamespace(title="Test", root=node)
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                           args={"old": "The term", "through": "embrace",
+                                 "blocks": [new_node("paragraph", "5", "Oil", "The term oil means")]},
+                           within=[("sentence", 3)])
+        engine = Engine(SimpleNamespace(), {})
+        engine._operate(inst, doc, node)
+        self.assertEqual(marked(node.children[0].body), "[+The term oil means+] all hydrocarbons.")
+        self.assertIn("the second sentence", engine.reworded[0][0])
+        with self.assertRaises(_NotApplied):  # text in no sentence, or the count alone, can't place it
+            engine._operate(Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace",
+                                        args={"old": "gilsonite", "new": "", "every": False, "except": None},
+                                        within=[("sentence", 3)]), doc, node)
+
+    def test_a_joined_sentence_is_found_in_the_introductory_text_once_there_are_subdivisions(self):
+        # S. 5653 § 2215(c)(1)(B): after (A) splits off paragraph (5), "Lease" is in the Code's fourth sentence,
+        # which the bill counts as the fifth.
+        def section():
+            return Node("section", "351", label=Text("§ 351."), body=Text(
+                "“Secretary” means the Secretary, “Mineral leasing laws” shall mean the Act. "
+                "“Lease” includes “prospecting permit”."),
+                children=[new_node("paragraph", "5", "Oil", "The term “oil” means oil.")])
+
+        def apply(node):
+            engine = Engine(SimpleNamespace(), {})
+            engine._operate(Instruction(
+                cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                args={"old": "“Lease”", "blocks": [new_node("paragraph", "3", "Lease", "The term “lease”")]},
+                within=[("sentence", 3)]), SimpleNamespace(title="Test", root=node), node)
+            return engine
+
+        node = section()
+        engine = apply(node)
+        self.assertEqual([c.value for c in node.children], ["3", "5"])
+        self.assertEqual(marked(node.children[0].body), "[+The term “lease”+] includes “prospecting permit”.")
+        self.assertIn("with a comma before “Mineral leasing laws”", engine.reworded[0][0])
+        node = section()
+        node.body = Text("“Secretary” means the Secretary; and the Act applies. “Lease” includes “prospecting permit”.")
+        engine = apply(node)  # nothing shows where the Code joined sentences, but only one has the quoted text
+        self.assertIn("the second sentence", engine.reworded[0][0])
+        node = section()
+        node.body = Text("“Secretary” means the Secretary; and the Act applies. “Lease” includes “prospecting permit”.")
+        node.children[0].body = Text("The term “oil” means oil. “Lease” has its own meaning.")
+        with self.assertRaises(_NotApplied):  # the quoted text is in a subdivision too
+            apply(node)
+
+    def test_a_sentence_the_code_joins_with_a_comma_gives_way_to_new_subdivisions(self):
+        # S. 5653 § 2215(c)(1)(C): 30 U.S.C. 351 runs the Act's third and fourth sentences together.
+        node = Node("section", "351", label=Text("§ 351."), body=Text(
+            "“United States” includes Alaska. “Secretary” means the Secretary of the Interior, “Mineral leasing "
+            "laws” shall mean the Act of 1920 and Acts amendatory of it."),
+            children=[new_node("paragraph", "5", "Oil", "The term “oil” means oil.")])
+        block = new_node("paragraph", "4", "Mineral leasing laws", "The term “mineral leasing laws” means—", [
+            new_node("subparagraph", "A", "", "the Mineral Leasing Act; and"),
+            new_node("subparagraph", "B", "", "all Acts amendatory of it.")])
+        engine = Engine(SimpleNamespace(), {})
+        engine._operate(Instruction(cite="§ 9", raw="", target=Target(), path=[],
+                                    action="replace_sentence_with_block", args={"n": 3, "blocks": [block]}),
+                        SimpleNamespace(title="Test", root=node), node)
+        self.assertEqual(marked(node.body), "“United States” includes Alaska. “Secretary” means the Secretary of the "
+                                            "Interior, [-“Mineral leasing laws” shall mean the Act of 1920 and Acts "
+                                            "amendatory of it.-]")
+        self.assertEqual([c.value for c in node.children], ["4", "5"])
+        self.assertIn("with a comma before “Mineral leasing laws”", engine.reworded[0][0])
+
+    def test_a_sentence_with_too_few_joins_is_not_counted(self):
+        node = Node("section", "1", label=Text("§ 1."), body=Text(
+            "“Secretary” means the Secretary, “Act” means the Act. “Fee” means $5."))
+        with self.assertRaises(_NotApplied):
+            Engine(SimpleNamespace(), {})._operate(Instruction(
+                cite="§ 9", raw="", target=Target(), path=[], action="replace_sentence_with_block",
+                args={"n": 4, "blocks": [new_node("paragraph", "4", "Fee", "The term")]}),
+                SimpleNamespace(title="Test", root=node), node)
+
+    def test_a_described_heading_joins_two_terms_and_needs_a_term_and_no_heading(self):
+        def apply(node):
+            Engine(SimpleNamespace(), {})._operate(Instruction(
+                cite="§ 9", raw="", target=Target(), path=[], action="insert_term_heading",
+                args={"unit": "paragraph"}), SimpleNamespace(title="Test", root=node), node)
+
+        node = Node("paragraph", "1", label=Text("(1)"),
+                    body=Text("The terms “acquired lands” and “lands acquired by the United States” mean lands."))
+        apply(node)
+        self.assertEqual(marked(node.heading), "[+Acquired lands; lands acquired by the United States+]")
+        for node in (Node("paragraph", "1", label=Text("(1)"), heading=Text("Lands"), body=Text("“Lands” means x.")),
+                     Node("paragraph", "1", label=Text("(1)"), body=Text("Lands are defined as “x”.")),
+                     Node("subparagraph", "A", label=Text("(A)"), body=Text("“Lands” means x."))):
+            with self.assertRaises(_NotApplied):
+                apply(node)
+
+    def test_a_struck_span_needs_its_end(self):
+        node = Node("section", "351", label=Text("§ 351."), body=Text("The term oil shall include all gases."))
+        doc = SimpleNamespace(title="Test", root=node)
+        inst = Instruction(cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                           args={"old": "The term", "through": "embrace",
+                                 "blocks": [new_node("paragraph", "5", "Oil", "The term oil means")]}, within=[])
+        with self.assertRaises(_NotApplied):
+            Engine(SimpleNamespace(), {})._operate(inst, doc, node)
+
+    def test_subdivisions_split_off_earlier_move_under_the_new_one_that_precedes_them(self):
+        # 54 U.S.C. 306108: S. 5653 § 2301(c)(1) makes the second sentence paragraph (2), then (c)(2) makes the
+        # first sentence subsection (b) with paragraph (1). (2) belongs in (b), after (1).
+        node = Node("section", "306108", label=Text("§ 306108."),
+                    body=Text("The head of any Federal agency having direct jurisdiction shall act. "
+                              "The head of the Federal agency shall afford comment."))
+        self.apply(node, "The head of the Federal agency",
+                   [new_node("paragraph", "2", "Opportunity to comment", "The head of any agency")], [("sentence", 2)])
+        self.apply(node, "The head of any Federal agency having direct", [new_node(
+            "subsection", "b", "Adverse effect", children=[new_node("paragraph", "1", "In general", "The head")])],
+            [("sentence", 1)])
+        (subsection,) = node.children
+        self.assertEqual([(c.kind, c.value) for c in subsection.children], [("paragraph", "1"), ("paragraph", "2")])
+        self.assertEqual(marked(subsection.children[0].body), "[+The head+] jurisdiction shall act. "
+                                                              "[-The head of the Federal agency-]")
+        self.assertEqual(marked(subsection.children[1].body), "[+The head of any agency+] shall afford comment.")
+        self.assertEqual(node.before_text(), "§ 306108.The head of any Federal agency having direct jurisdiction "
+                                             "shall act. The head of the Federal agency shall afford comment.")
+
     def test_existing_subdivisions_block_a_split(self):
         node = Node("paragraph", "1", label=Text("(1)"), body=Text("The Secretary shall—"),
                     children=[Node("subparagraph", "A", label=Text("(A)"), body=Text("act."))])
@@ -611,6 +1408,83 @@ class BlockTests(unittest.TestCase):
         node = Node("subsection", "t", label=Text("(t)"), body=Text("Nothing in this section"))
         with self.assertRaises(_NotApplied):
             self.apply(node, "(t) Nothing in this section", [new_node("subsection", "u", "Savings", "Nothing")])
+
+
+class FollowingTests(unittest.TestCase):
+    """'… and inserting the following:' with run-in text before new subdivisions, text added at the end, and
+    new subdivisions inserted before others: the shapes in S. 5653 §§ 2101(f)(2), 2233(a), 2252(c)(3) and
+    2301(c)(3)."""
+    CODE = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>16</docNumber></meta><main>'
+            '<section identifier="/us/usc/t16/s824p"><num value="824p">§ 824p.</num>'
+            '<subsection><num value="a">(a)</num><content>The Department shall act as the lead agency.</content>'
+            '</subsection><subsection><num value="b">(b)</num><content>Except under section 388(d) of the Energy '
+            'Policy Act of 2005, the Secretary shall issue a lease on a competitive basis.</content></subsection>'
+            '<subsection><num value="c">(c)</num><content>The fee is due, as defined in section 2(f), in full.'
+            '</content></subsection><subsection><num value="e">(e)</num><content>Final.</content></subsection>'
+            '<sourceCredit>(June 10, 1920, ch. 285, pt. II, § 216.)</sourceCredit></section></main></uscDoc>').encode()
+
+    def run_bill(self, *instructions):
+        items = "".join(f"<paragraph><enum>({n})</enum>{text}</paragraph>" for n, text in enumerate(instructions, 1))
+        bill = parse_sections("<section><enum>2.</enum><text>Section 216 of the Federal Power Act (16 U.S.C. 824p) "
+                              f"is amended—</text>{items}</section>")
+        self.assertEqual(bill.problems, [])
+        outcome = apply_bill(bill, {16: CodeTitle(self.CODE)})
+        return outcome, find_doc(outcome, "16 U.S.C. § 824p").root
+
+    def test_end_punctuation_gives_way_to_run_in_text_and_new_subdivisions(self):
+        outcome, root = self.run_bill(
+            "<text>in subsection (a), by striking the period at the end and inserting the following:</text>"
+            "<quoted-block><text>, except that—</text><paragraph><enum>(1)</enum><text>the Commission shall act; "
+            "and</text></paragraph><paragraph><enum>(2)</enum><text>the Secretary shall act offshore.</text>"
+            "</paragraph><after-quoted-block>;</after-quoted-block></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (1, []))
+        subsection = root.children[0]
+        self.assertEqual(marked(subsection.body), "The Department shall act as the lead agency[-.-][+, except that—+]")
+        self.assertEqual([c.value for c in subsection.children], ["1", "2"])
+
+    def test_run_in_text_opened_in_the_instruction_and_a_new_subdivision_after_the_one_named(self):
+        outcome, root = self.run_bill(
+            "<text>in subsection (b), by striking <quote>, the Secretary shall issue a lease</quote> and inserting "
+            "the following: “(16 U.S.C. 824p note), the Secretary—</text><quoted-block><paragraph><enum>(1)</enum>"
+            "<text>shall issue a lease</text></paragraph><after-quoted-block>; and</after-quoted-block>"
+            "</quoted-block>",
+            "<text>in subsection (b)(1) (as so designated), by striking the period at the end and inserting the "
+            "following: “; and</text><quoted-block><paragraph><enum>(2)</enum><text>may issue a permit.</text>"
+            "</paragraph><after-quoted-block>.</after-quoted-block></quoted-block>")
+        self.assertEqual((outcome.applied, outcome.flags), (2, []))
+        subsection = root.children[1]
+        self.assertEqual(marked(subsection.body), "Except under section 388(d) of the Energy Policy Act of 2005"
+                         "[-, the Secretary shall issue a lease-][+ (16 U.S.C. 824p note), the Secretary—+]")
+        first, second = subsection.children
+        self.assertEqual(marked(first.body), "[+shall issue a lease+] on a competitive basis[-.-][+; and+]")
+        self.assertEqual((second.value, marked(second.body)), ("2", "[+may issue a permit.+]"))
+
+    def test_text_added_at_the_end_is_a_new_sentence(self):
+        outcome, root = self.run_bill("<text>in subsection (e), by adding at the end the following: <quote>The "
+                                      "Commission shall publish it.</quote>.</text>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual(marked(root.children[3].body), "Final.[+ The Commission shall publish it.+]")
+
+    def test_new_subdivisions_inserted_before_one_named(self):
+        outcome, root = self.run_bill(
+            "<text>by inserting before subsection (e) the following:</text><quoted-block><subsection>"
+            "<enum>(d)</enum><text>Reports are due.</text></subsection><after-quoted-block>;</after-quoted-block>"
+            "</quoted-block>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual([c.value for c in root.children], ["a", "b", "c", "d", "e"])
+
+    def test_a_locator_without_a_comma(self):
+        outcome, root = self.run_bill("<text>in subsection (c) by striking <quote>, as defined in section 2(f),"
+                                      "</quote>.</text>")
+        self.assertEqual(outcome.applied, 1)
+        self.assertEqual(marked(root.children[2].body), "The fee is due[-, as defined in section 2(f),-] in full.")
+
+    def test_run_in_text_with_an_operation_that_cant_place_it_isnt_recognized(self):
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 216 of the Federal Power Act (16 U.S.C. 824p) is amended by "
+            "adding at the end the following:</text><quoted-block><text>Also—</text><subsection><enum>(f)</enum>"
+            "<text>more.</text></subsection></quoted-block></section>")
+        self.assertEqual([p.reason for p in bill.problems], ["instruction wording isn't a recognized pattern"])
 
 
 class OpeningTests(unittest.TestCase):
@@ -802,6 +1676,27 @@ class DocxTests(unittest.TestCase):
         defined = [f.get(f"{W}id") for f in self.footnotes if f.get(f"{W}type") is None]
         self.assertTrue(refs)
         self.assertEqual(refs, defined)
+
+    def test_the_cover_page_links_to_the_appendix(self):
+        links = [h for h in self.document.iter(f"{W}hyperlink") if h.get(f"{W}anchor")]
+        self.assertEqual(["".join(h.itertext()) for h in links], ["appendix"])
+        marks = {b.get(f"{W}name"): b for b in self.document.iter(f"{W}bookmarkStart")}
+        self.assertIn(links[0].get(f"{W}anchor"), marks)
+        heading = next(p for p in self.document.iter(f"{W}p") if marks[links[0].get(f"{W}anchor")] in list(p))
+        self.assertTrue("".join(heading.itertext()).startswith("Appendix: provisions that don't amend"))
+
+    def test_no_appendix_no_link(self):
+        bill = parse_sections("<section><enum>2.</enum><text>Section 201 of the Federal Power Act (16 U.S.C. 824) "
+                              "is amended by striking <quote>fair</quote> and inserting <quote>just</quote>."
+                              "</text></section>")
+        outcome = apply_bill(bill, {16: CodeTitle(ActNameTests.CODE)})
+        self.assertEqual(bill.provisions, [])
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "ih", verify(bill, outcome))
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        self.assertNotIn("w:anchor=", document)
+        self.assertNotIn("bookmarkStart", document)
 
     def test_repeat_citations_refer_back_to_the_first_note(self):
         texts = ["".join(f.itertext()) for f in self.footnotes]

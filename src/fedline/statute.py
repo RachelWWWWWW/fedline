@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from xml.etree import ElementTree as ET
 
 ORIG, DEL, INS = "orig", "del", "ins"
+# Original text the bill moves to a new place, as when it puts paragraphs in numerical order. It's both
+# original and current text, so it counts in before() and current() alike.
+MOVED = "moved"
 LEVELS = ("section", "subsection", "paragraph", "subparagraph", "clause", "subclause", "item", "subitem",
           "subsubitem")
 # Elements the Code uses for subdivisions. "level" is a generic one, used where the usual names don't fit.
@@ -72,7 +75,7 @@ class Text:
         carried: list[str] = []
         kept: list[Segment] = []
         for seg in self.segments[first:last]:
-            if seg.status == ORIG:
+            if seg.status in (ORIG, MOVED):
                 kept.append(Segment(seg.text, DEL, (source,)))
             elif seg.status == INS:
                 carried.extend(seg.sources)
@@ -114,6 +117,16 @@ class Node:
     children: list["Node"] = field(default_factory=list)
     tail: Text = field(default_factory=Text)
     deleted: bool = False
+    # The children in their order before the bill moved any, kept so the original text can still be read
+    # in order.
+    original_order: list["Node"] | None = field(default=None, compare=False, repr=False)
+    # Set on a provision the bill moves: the instruction that moved it. Its old place is shown too.
+    moved_by: str = field(default="", compare=False)
+    # The kind before a redesignation changed it, as when subsections become paragraphs.
+    original_kind: str = field(default="", compare=False)
+    # Set when the bill strikes this provision's designation but keeps the rest of its text, which then runs
+    # on in the text before it, as when a span ends partway into it.
+    run_in: bool = field(default=False, compare=False)
 
     def texts(self, headings: bool = True):
         """Yield this subtree's text blocks in reading order."""
@@ -163,10 +176,23 @@ class Node:
                 or self.tail.changed() or any(c.changed() for c in self.children))
 
     def before_text(self) -> str:
+        children = self.children
+        if self.original_order is not None:
+            known = {id(c) for c in self.original_order}
+            children = self.original_order + [c for c in self.children if id(c) not in known]
         parts = [self.label.before(), self.heading.before(), self.body.before()]
-        parts += [c.before_text() for c in self.children if c.before_text()]
+        parts += [c.before_text() for c in children if c.before_text()]
         parts.append(self.tail.before())
         return "".join(parts)
+
+    def mark_moved(self, source: str) -> None:
+        """Mark this provision's original text as moved by source, keeping the bill's other edits to it."""
+        for text in (self.label, self.heading, self.body, self.tail):
+            for seg in text.segments:
+                if seg.status == ORIG:
+                    seg.status, seg.sources = MOVED, (source,)
+        for child in self.children:
+            child.mark_moved(source)
 
 
 @dataclass
@@ -334,6 +360,37 @@ class CodeTitle:
                         for n in re.findall(r"^/us/usc/t\d+[a-zA-Z]?/s([^/]+)$", s.get("identifier") or "")]
         return []
 
+    def chapter_toc(self, chapter: str) -> Document | None:
+        """A chapter's table of sections, as a document of entries such as '302701. Program to assist …'. It
+        comes just before the chapter's first section."""
+        for el in self.root.iter(f"{{{self.ns}}}chapter"):
+            num = el.find(f"{{{self.ns}}}num")
+            if num is None or num.get("value") != chapter:
+                continue
+            toc = el.find(f"{{{self.ns}}}toc")
+            if toc is None:
+                return None
+            root = Node("toc", value=chapter)
+            source = []
+            for item in toc.iter(f"{{{self.ns}}}tocItem"):
+                columns = [_flat(c) for c in item.findall(f"{{{self.ns}}}column")]
+                if not columns:
+                    continue
+                number, words = columns[0], " ".join(columns[1:])
+                root.children.append(Node("toc-entry", value=number.rstrip("."), label=Text(number),
+                                          body=Text(words)))
+                source.append(number + words)
+            sections = self.chapter_sections(chapter)
+            return Document(
+                key=f"{self.number}usc-ch{chapter}-toc",
+                title=f"{self.number} U.S.C. chapter {chapter}, table of sections",
+                root=root,
+                basis="code",
+                source_text="".join(source),
+                order=(self.number, _sort_key(sections[0] if sections else chapter), -1),
+            )
+        return None
+
     def document(self, number: str) -> Document | None:
         el = self.sections.get(number)
         if el is None:
@@ -388,17 +445,29 @@ class CodeTitle:
                 return self._note_document(number, note, quoted, act_name)
         return None
 
-    def note_for_public_law(self, public_law: str, section: str) -> Document | None:
-        """Find a public law section reproduced in the notes of any section of this title."""
+    def note_for_public_law(self, public_law: str, section: str,
+                            path: tuple[str, ...] = ()) -> tuple[Document, int] | None:
+        """Find a public law section reproduced in the notes of any section of this title.
+
+        A note may reproduce only part of the section, as in origin ".../s3511/c" for subsection (c). That
+        note is used when the instruction's path, given as designations, starts with that part. Returns the
+        note and how many leading steps of the path it covers. A note of the whole section is preferred."""
         congress, law = public_law.split("-")
-        pattern = rf"/us/pl/{congress}/{law}(/.*)?/s{re.escape(section)}$"
+        pattern = rf"/us/pl/{congress}/{law}(?:/.*)?/s{re.escape(section)}(?P<part>(?:/\w+)*)"
+        partial = None
         for number, el in self.sections.items():
             for note in el.iter(f"{{{self.ns}}}note"):
                 quoted = note.find(f".//{{{self.ns}}}quotedContent")
-                if quoted is not None and re.fullmatch(pattern, quoted.get("origin") or ""):
-                    name = f"Pub. L. {public_law}, § {section}"
-                    return self._note_document(number, note, quoted, name)
-        return None
+                match = re.fullmatch(pattern, quoted.get("origin") or "") if quoted is not None else None
+                if not match:
+                    continue
+                part = tuple(match.group("part").split("/")[1:])
+                if not part:
+                    return self._note_document(number, note, quoted, f"Pub. L. {public_law}, § {section}"), 0
+                if partial is None and path[:len(part)] == part:
+                    name = f"Pub. L. {public_law}, § {section}" + "".join(f"({p})" for p in part)
+                    partial = self._note_document(number, note, quoted, name), len(part)
+        return partial
 
     def _note_document(self, number: str, note: ET.Element, quoted: ET.Element, name: str) -> Document:
         root = Node(kind="note")

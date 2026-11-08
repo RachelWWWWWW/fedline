@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from xml.etree import ElementTree as ET
 
 from .statute import LEVELS, Node, Text, INS, norm
@@ -26,8 +26,8 @@ _LEAD_CODE = re.compile(
     r"(?:, as amended by [^,]+)?, is (?:further )?amended(?P<rest>.*)$"
 )
 _LEAD_CHAPTER = re.compile(
-    r"^Chapter (?P<chapter>\w+) of title (?P<title>\d+), United States Code"
-    r"(?:, as amended by [^,]+)?, is (?:further )?amended(?P<rest>.*)$"
+    r"^(?:Chapter|(?P<toc>The table of sections for chapter)) (?P<chapter>\w+) of title (?P<title>\d+), "
+    r"United States Code(?:, as amended by [^,]+)?, is (?:further )?amended(?P<rest>.*)$"
 )
 # An Act named without a citation, as in "The Federal Power Act is amended by inserting after section 216
 # (16 U.S.C. 824p) the following:". The citation, if any, comes later in the instruction.
@@ -65,6 +65,7 @@ class Target:
     is_note: bool = False
     public_law: str | None = None
     chapter: str | None = None
+    toc: bool = False  # the chapter's table of sections, not its text
 
 
 @dataclass
@@ -154,6 +155,9 @@ def _parse_target(match: re.Match) -> Target | None:
         target.title = int(groups["title"])
         target.chapter = groups["chapter"]
         target.name = f"chapter {groups['chapter']} of title {groups['title']}, United States Code"
+        if groups.get("toc"):
+            target.toc = True
+            target.name = f"the table of sections for {target.name}"
         target.cite = target.name
         return target
     if groups.get("title"):
@@ -179,6 +183,10 @@ def _parse_target(match: re.Match) -> Target | None:
     elif public_law:
         target.public_law = f"{public_law.group(1)}-{public_law.group(2)}"
         target.is_note = True
+    elif re.fullmatch(r"\d+ Stat\. \d+(?:, (?:chapter|ch\.) \w+)?", target.cite):
+        # "The Act of February 5, 1948 (62 Stat. 17, chapter 45)": no Code citation here. Each instruction
+        # under it may give one, as in "in section 2 (62 Stat. 18, chapter 45; 25 U.S.C. 324)".
+        return target
     else:
         return None
     return target
@@ -243,6 +251,11 @@ _ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixt
 _ORDINAL = "|".join(_ORDINALS)
 
 
+# What ends a locator: a comma or dash, the end of the text, or, as bills sometimes omit the comma, the
+# operation itself ("in the matter preceding subparagraph (A) by striking").
+_SEP = r"(?:, |—|$| (?=by ))"
+
+
 def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool, str]:
     """Consume leading 'in subsection (a), in the heading, in the first sentence,' phrases."""
     path: list[tuple[str, str]] = []
@@ -250,29 +263,29 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
     heading = False
     text = _AS_NOTE.sub("", text)
     while True:
-        match = re.match(rf"^in the ({_ORDINAL}) sentence(?:, |—|$)", text)
+        match = re.match(rf"^in the ({_ORDINAL}) (sentence|proviso){_SEP}", text)
         if match:
-            within.append(("sentence", _ORDINALS[match.group(1)]))
+            within.append((match.group(2), _ORDINALS[match.group(1)]))
             text = text[match.end():]
             continue
-        match = re.match(r"^in the (?:undesignated )?matter (preceding|following) (\w+) \((\w+)\)(?:, |—|$)", text)
+        match = re.match(rf"^in the (?:undesignated )?matter (preceding|following) (\w+) \((\w+)\){_SEP}", text)
         if match and match.group(2) in LEVELS:
             within.append(match.groups())
             text = text[match.end():]
             continue
-        match = re.match(r"^in the (?:\w+ )?heading of (\w+) ((?:\(\w+\))+)(?:, |—|$)", text)
+        match = re.match(rf"^in the (?:\w+ )?heading of (\w+) ((?:\(\w+\))+){_SEP}", text)
         if match:
             path += _path_from(match.group(1), match.group(2))
             heading = True
             text = text[match.end():]
             continue
-        match = re.match(r"^in the (?:\w+ )?heading(?:, |—|$)", text)
+        match = re.match(rf"^in the (?:\w+ )?heading{_SEP}", text)
         if match:
             heading = True
             text = text[match.end():]
             continue
         match = re.match(
-            rf"^in each of ({_KINDS}) ((?:\(\w+\))+(?:(?:,? and |, | through )(?:\(\w+\))+)*)(?:, |—|$)", text)
+            rf"^in each of ({_KINDS}) ((?:\(\w+\))+(?:(?:,? and |, | through )(?:\(\w+\))+)*){_SEP}", text)
         if match:
             alternatives = _each_paths(_LEVEL_WORDS[match.group(1)], match.group(2))
             if alternatives is None:
@@ -280,17 +293,39 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
             path.append(("each", alternatives))
             text = text[match.end():]
             continue
-        match = re.match(r"^in section (\w+)(?:, |—|$)", text)
+        match = re.match(rf"^in section (\w+){_SEP}", text)
         if match:
             path.append(("section", match.group(1)))
             text = text[match.end():]
             continue
-        match = re.match(r"^in (\w+) ((?:\(\w+\))+)(?:, |—|$)", text)
+        match = re.match(rf"^in (\w+) ((?:\(\w+\))+){_SEP}", text)
         if match and match.group(1) in LEVELS:
             path += _path_from(match.group(1), match.group(2))
             text = text[match.end():]
             continue
         return path, within, heading, text
+
+
+_SECTION_CITED = re.compile(rf"^in (?:section (?P<section>\w+)|the (?P<first>first) section)(?P<path>(?:\(\w+\))*) "
+                            rf"{_CITE}(?:, |—|$)")
+
+
+def _locate_section(target: Target, text: str) -> tuple[Target, str]:
+    """Handle "in section 1412(b)(2) (50 U.S.C. 98b note)," under a lead-in that names the Act without a
+    section, as in "The … Act (Public Law 118–159) is amended—". Each instruction then gets its own section,
+    and its own Code citation when the Act was cited only by Public Law or the Statutes at Large, so the right
+    title is searched. "In the first section (62 Stat. 17, chapter 45; 25 U.S.C. 323)" is section 1."""
+    match = _SECTION_CITED.match(text)
+    if not match or target.section or target.chapter or target.name.startswith("title "):
+        return target, text
+    located = replace(target, section="1" if match.group("first") else match.group("section"),
+                      path=target.path + _level_for(_parts_of(match.group("path")), "section"))
+    # The Code citation may follow a Statutes at Large one: "62 Stat. 18, chapter 45; 25 U.S.C. 324".
+    usc = re.fullmatch(r"(?:[^;]*; )?(\d+) U\.S\.C\. (\w+)(?:\([^)]*\))*( note)?", match.group("cite"))
+    if usc and target.title is None:
+        located.title, located.usc_section = int(usc.group(1)), usc.group(2)
+        located.is_note = located.is_note or bool(usc.group(3))
+    return located, text[match.end():]
 
 
 def _each_paths(kind: str, text: str) -> tuple | None:
@@ -315,8 +350,18 @@ def _path_from(kind: str, values: str) -> list[tuple[str, str]]:
 _PUNCTUATION = {"period": ".", "semicolon": ";", "comma": ",", "colon": ":"}
 
 
-def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str, dict] | None:
-    """Recognize an instruction's operation. Returns None when it isn't understood."""
+def _parse_action(text: str, quotes: list[str], blocks: list[Node], lead: str = "") -> tuple[str, dict] | None:
+    """Recognize an instruction's operation. Returns None when it isn't understood.
+
+    lead is run-in text that the new subdivisions follow, as in 'inserting the following: “, except
+    that—” (A) …'. Only operations that place it accept it."""
+    parsed = _parse_operation(text, quotes, blocks, lead)
+    if parsed and lead and "lead" not in parsed[1]:
+        return None
+    return parsed
+
+
+def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str) -> tuple[str, dict] | None:
     text = re.sub(r"[;.,]?(?: and| or)?$", "", text).strip()
     q = lambda m, name: quotes[int(m.group(name))]
 
@@ -335,7 +380,18 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
     if match and match.group("b") and not blocks:
         return "replace", {"old": q(match, "a"), "new": q(match, "b"), "every": False, "except": None}
     if match and blocks and not match.group("b"):
-        return "replace_with_block", {"old": q(match, "a"), "blocks": blocks}
+        return "replace_with_block", {"old": q(match, "a"), "blocks": blocks, "lead": lead}
+
+    match = re.fullmatch(
+        rf"by striking (?:⟦(?P<a>\d+)⟧|the (?P<pa>{punct})) at the end and inserting the following:?", text)
+    if match and blocks:
+        return "replace_at_end_with_block", {
+            "old": q(match, "a") if match.group("a") else _PUNCTUATION[match.group("pa")],
+            "blocks": blocks, "lead": lead}
+
+    match = re.fullmatch(r"by adding at the end the following:? ⟦(?P<b>\d+)⟧", text)
+    if match and not blocks:
+        return "add_text_at_end", {"new": q(match, "b")}
 
     match = re.fullmatch(
         rf"by striking (?:⟦(?P<a>\d+)⟧|the (?P<pa>{punct}))(?: after the (?P<after>{punct}))? at the end"
@@ -355,6 +411,17 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
             "end_punct": _PUNCTUATION.get(match.group("pc") or ""),
             "new": new_text(match)}
 
+    # The struck span gives way to new subdivisions, as in S. 5653 § 2215(c)(1)(A): 'in the sixth sentence,
+    # by striking "The term" and all that follows through "embrace" and inserting the following: (5) Oil.—'.
+    match = re.fullmatch(r"by striking ⟦(?P<a>\d+)⟧ and all that follows through ⟦(?P<c>\d+)⟧ and inserting the "
+                         r"following:?", text)
+    if match and blocks:
+        return "replace_with_block", {"old": q(match, "a"), "through": q(match, "c"), "blocks": blocks, "lead": lead}
+
+    match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ after the (?P<unit>\w+) designation", text)
+    if match and match.group("unit") in LEVELS:
+        return "insert_at_start", {"new": q(match, "a"), "unit": match.group("unit")}
+
     match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ before ⟦(?P<b>\d+)⟧", text)
     if match:
         return "insert_before", {"new": q(match, "a"), "anchor": q(match, "b")}
@@ -369,6 +436,21 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
 
     text = _AS_NOTE.sub("", text)
     kinds = "|".join(_LEVEL_WORDS)
+
+    # A span from the matter preceding the first subdivision into a later one: "by striking “the later of” in
+    # the matter preceding subclause (I) and all that follows through the semicolon at the end of subclause
+    # (II)", "… through “(A) the” in subparagraph (A)".
+    match = re.fullmatch(
+        rf"by striking ⟦(?P<a>\d+)⟧ in the matter preceding (?P<k1>{kinds}) \((?P<v1>\w+)\) and all that follows "
+        rf"through (?:⟦(?P<c>\d+)⟧ in (?P<k2>{kinds}) \((?P<v2>\w+)\)|the (?P<pc>{punct}) at the end of "
+        rf"(?P<k3>{kinds}) \((?P<v3>\w+)\))(?: and inserting {new})?", text)
+    if match:
+        return "replace_across", {
+            "start": q(match, "a"), "first": (_LEVEL_WORDS[match.group("k1")], match.group("v1")),
+            "end": q(match, "c") if match.group("c") else None,
+            "end_punct": _PUNCTUATION.get(match.group("pc") or ""),
+            "last": (_LEVEL_WORDS[match.group("k2") or match.group("k3")], match.group("v2") or match.group("v3")),
+            "new": new_text(match)}
 
     match = re.fullmatch(rf"by striking ({kinds}) (.+?) and inserting the following:?", text)
     if match and blocks:
@@ -391,13 +473,47 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
         if values:
             return "delete_nodes", {"kind": kind, "values": values}
 
-    match = re.fullmatch(rf"by redesignating ({kinds}) (.+?) as ({kinds}) (.+?)(?:, respectively)?", text)
+    # A heading the bill describes rather than quotes: "by inserting a paragraph heading, the text of which
+    # comprises the term defined in that paragraph" (S. 5653 § 2222(a)(1)(G)(ii)).
+    match = re.fullmatch(rf"by inserting an? ({kinds}) heading, the text of which (?:comprises|consists of|is) the "
+                         r"terms? defined in (?:that|such|the) (\w+)", text)
+    if match and _LEVEL_WORDS[match.group(1)] == _LEVEL_WORDS.get(match.group(2)):
+        return "insert_term_heading", {"unit": _LEVEL_WORDS[match.group(1)]}
+
+    # Formatting only: "by indenting clauses (i) through (v) appropriately", "by moving the margins of
+    # subparagraphs (A) and (B) 2 ems to the right".
+    match = re.fullmatch(
+        rf"by (?:indenting ({kinds}) (.+?)(?: appropriately)?|moving the margins? of ({kinds}) (.+?) "
+        r"\d+ ems? to the (?:right|left))", text)
+    if match:
+        kind = _LEVEL_WORDS[match.group(1) or match.group(3)]
+        values = _designators(match.group(2) or match.group(4), kind)
+        if values:
+            return "indent", {"kind": kind, "values": values}
+
+    # Only designations, so trailing words such as "and moving the paragraphs so as to appear in numerical
+    # order" are read rather than swallowed.
+    designations = r"(?:\(\w+\)|\d+\w*)(?:(?:,? and |, | through )(?:\(\w+\)|\d+\w*))*"
+    match = re.fullmatch(
+        rf"by redesignating ({kinds}) ({designations}) as ({kinds}) ({designations})(?:,? respectively)?"
+        rf"(?:,? and (?:indenting appropriately|(?P<move>(?:indenting and )?moving the (?:{kinds}) so as to "
+        r"appear in numerical order)))?", text)
     if match:
         kind = _LEVEL_WORDS[match.group(1)]
         old = _designators(match.group(2), kind)
-        new = _designators(match.group(4), _LEVEL_WORDS[match.group(3)])
+        new_kind = _LEVEL_WORDS[match.group(3)]
+        new = _designators(match.group(4), new_kind)
         if old and new:
-            return "redesignate", {"kind": kind, "old": old, "new": new}
+            return "redesignate", {"kind": kind, "old": old, "new": new, "new_kind": new_kind,
+                                   "reorder": bool(match.group("move"))}
+
+    match = re.fullmatch(rf"by moving the ({kinds}) so as to appear in numerical order", text)
+    if match:
+        return "reorder", {"kind": _LEVEL_WORDS[match.group(1)]}
+
+    match = re.fullmatch(rf"by striking the ({_ORDINAL}) sentence and inserting the following:?", text)
+    if match and blocks:
+        return "replace_sentence_with_block", {"n": _ORDINALS[match.group(1)], "blocks": blocks, "lead": lead}
 
     match = re.fullmatch(
         rf"by striking the ({_ORDINAL}) sentence(?: and inserting the following:? ⟦(?P<b>\d+)⟧)?", text)
@@ -423,12 +539,12 @@ def _parse_action(text: str, quotes: list[str], blocks: list[Node]) -> tuple[str
     if match and blocks:
         return "add_at_end", {"blocks": blocks}
 
-    match = re.fullmatch(rf"by inserting after ({kinds}) (.+?) the following:?", text)
+    match = re.fullmatch(rf"by inserting (after|before) ({kinds}) (.+?) the following:?", text)
     if match and blocks:
-        kind = _LEVEL_WORDS[match.group(1)]
-        values = _designators(match.group(2), kind)
+        kind = _LEVEL_WORDS[match.group(2)]
+        values = _designators(match.group(3), kind)
         if values:
-            return "insert_after_node", {"kind": kind, "values": values, "blocks": blocks}
+            return f"insert_{match.group(1)}_node", {"kind": kind, "values": values, "blocks": blocks}
 
     return None
 
@@ -455,11 +571,38 @@ def _new_node(el: ET.Element, source: str) -> Node:
     return node
 
 
+def _toc_entry(el: ET.Element, source: str) -> Node:
+    """An entry for a table of sections, as in '302707. Program evaluation.'"""
+    text = norm(_quoted_flat(el))
+    match = re.match(r"(?:Sec\. )?(\w+)\.\s+", text)
+    number = match.group(0).strip() if match else ""
+    return Node(kind="toc-entry", value=match.group(1) if match else "", label=Text(number, INS, (source,)),
+                body=Text(text[len(match.group(0)):] if match else text, INS, (source,)))
+
+
 def _block_nodes(el: ET.Element, source: str) -> list[Node]:
     blocks = []
     for block in el.findall("quoted-block"):
         blocks.extend(_new_node(child, source) for child in block if child.tag in LEVELS)
+        for toc in block.findall("toc"):
+            blocks.extend(_toc_entry(entry, source) for entry in toc.findall("toc-entry"))
     return blocks
+
+
+def _lead_text(el: ET.Element, rest: str, blocks: list[Node]) -> tuple[str, str]:
+    """Run-in text that new subdivisions follow. Bills give it either as a quotation the instruction opens
+    and the quoted block closes, as in 'inserting the following: “; and' then (B), or as text at the top of
+    the quoted block. Returns the instruction without it, and the text."""
+    if not blocks:
+        return rest, ""
+    match = re.search(r"( the following:?) “([^”⟦⟧]*)$", rest)
+    if match:
+        return rest[:match.end(1)], norm(match.group(2))
+    block = el.find("quoted-block")
+    first = next(iter(block), None) if block is not None else None
+    if first is not None and first.tag == "text":
+        return rest, norm(_quoted_flat(first))
+    return rest, ""
 
 
 def _is_lead(text: str) -> re.Match | None:
@@ -551,7 +694,8 @@ class _Parser:
             self.bill.problems.append(ParseProblem(_cite(cite), "", "instruction has no text"))
             return
         text, quotes = tokenize(text_el)
-        located, more_within, heading, rest = _parse_locators(text)
+        target, rest = _locate_section(target, text)
+        located, more_within, heading, rest = _parse_locators(rest)
         children = [c for c in el if c.tag in _PARTS]
         if not rest and children:
             for child in children:
@@ -562,7 +706,9 @@ class _Parser:
     def leaf(self, el, rest, quotes, target, path, within, cite, heading, raw=None) -> None:
         cite_text = _cite(cite)
         located, more_within, more_heading, rest = _parse_locators(rest.strip())
-        parsed = _parse_action(rest, quotes, _block_nodes(el, cite_text))
+        blocks = _block_nodes(el, cite_text)
+        rest, lead = _lead_text(el, rest, blocks)
+        parsed = _parse_action(rest, quotes, blocks, lead)
         full = raw or rest
         for i, quote in enumerate(quotes):
             full = full.replace(f"⟦{i}⟧", f"“{quote}”")

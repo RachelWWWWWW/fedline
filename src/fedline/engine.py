@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 
-from .bill import Bill, Instruction, Target
-from .statute import INS, Act, CodeTitle, Document, Node, Segment, Text, norm
+from .bill import _ROMANS, Bill, Instruction, Target
+from .statute import INS, LEVELS, Act, CodeTitle, Document, Node, Segment, Text, norm
 
 
 @dataclass
@@ -35,6 +35,9 @@ class Outcome:
     applied: int = 0
     failed: int = 0
     release_points: dict[int, str] = field(default_factory=dict)
+    # Headings taken from a provision's own text, as the term it defines, where the bill describes the heading
+    # rather than quoting it: (node, heading). Verification checks them against the provision, not the bill.
+    term_headings: list[tuple[Node, str]] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -47,6 +50,103 @@ def _word_matches(phrase: str, text: str, ignore_case: bool = False) -> list[re.
     before = r"(?<!\w)" if phrase[:1].isalnum() else ""
     after = r"(?!\w)" if phrase[-1:].isalnum() else ""
     return list(re.finditer(rf"{before}{re.escape(phrase)}{after}", text, flags))
+
+
+# How the Code's editors reword an Act's text, as (pattern in the bill's phrase, builder of a pattern for the
+# Code's text). Each builder gets the match and the Act's section numbers mapped to Code sections, and whether
+# the match ends the phrase, and returns a regex that accepts both wordings.
+_DATE = r"[A-Z][a-z]+\.? \d{1,2}, \d{4}"
+_PARTS_RE = r"(?:\(\w+\))*"
+
+
+def _either(*alternatives: str) -> str:
+    return "(?:" + "|".join(dict.fromkeys(alternatives)) + ")"
+
+
+def _number(value: str, numbers: dict[str, str]) -> str:
+    return _either(re.escape(value), re.escape(numbers[value])) if value in numbers else re.escape(value)
+
+
+def _cite_ref(m, numbers, at_end):
+    """"section 216(a) of the Federal Power Act (16 U.S.C. 824p(a))": the Code may print "section 824p(a) of
+    title 16", or keep the name and bracket the citation."""
+    cite = rf"[(\[]?{m['title']} U\.S\.C\. {re.escape(m['usc'])}[)\]]?"
+    named = rf"section {re.escape(m['sec'])} of {re.escape(m['act'])} {cite}"
+    return _either(named, rf"section {re.escape(m['usc'])} of title {m['title']}")
+
+
+def _section_ref(m, numbers, at_end):
+    """"section 3(13) of this Act", "section 2(c) herein", "section 304(l)": the Code prints its own
+    section number, followed by "of this title"."""
+    if m["num"] not in numbers:
+        return None
+    reference = rf"section {_number(m['num'], numbers)}{re.escape(m['parts'])}"
+    if m["suffix"]:
+        return reference + r"(?: of this (?:Act|title|chapter)| herein)"
+    # The Code may add "of this title" where the Act has nothing, but not at the end of the phrase, where
+    # striking it would leave the new text without it.
+    return reference if at_end else reference + "(?: of this title)?"
+
+
+def _bare_number(m, numbers, at_end):
+    """An Act section in a list, as in "212, 215, and 222" or "section 402, and (G)". The Code puts "of this
+    title" after the last number of a list, which may fall inside the phrase."""
+    if m["num"] not in numbers:
+        return None
+    return _number(m["num"], numbers) + re.escape(m["parts"]) + ("" if at_end else "(?: of this title)?")
+
+
+_CODE_WORDING = [
+    (re.compile(r"section (?P<sec>\w+" + _PARTS_RE + r") of (?P<act>(?:the )?[A-Z][^()]*? Act(?: of \d{4})?) "
+                r"\(?(?P<title>\d+) U\.S\.C\. (?P<usc>\w+" + _PARTS_RE + r")\)?"), _cite_ref),
+    (re.compile(r"\(?(?P<title>\d+) U\.S\.C\. (?P<usc>\w+" + _PARTS_RE + r")\)?"),
+     lambda m, n, e: rf"[(\[]?{m['title']} U\.S\.C\. {re.escape(m['usc'])}[)\]]?"),
+    (re.compile(r"the date of (?:the )?enactment of this (?:Act|section|subsection|paragraph|title)"),
+     lambda m, n, e: _either(re.escape(m[0]), _DATE)),
+    (re.compile(r"(?P<unit>title|subtitle|part|chapter) (?P<num>\w+) of this Act"),
+     lambda m, n, e: _either(re.escape(m[0]), rf"(?:subchapter|part|chapter|subtitle) {re.escape(m['num'])} "
+                                               r"of this (?:chapter|subchapter|title)")),
+    (re.compile(r"this Act\b"), lambda m, n, e: r"this (?:Act|chapter|subchapter|title)"),
+    (re.compile(r"section (?P<num>\d+[A-Za-z]?(?:–\d+)?)(?P<parts>" + _PARTS_RE + r")"
+                r"(?P<suffix> of this Act| herein)?"), _section_ref),
+    (re.compile(r"(?<![\w(–-])(?P<num>\d+[A-Za-z]?(?:–\d+)?)(?P<parts>" + _PARTS_RE + r")(?![\w–-])"), _bare_number),
+    (re.compile(r"['’]"), lambda m, n, e: "['’]"),
+    (re.compile(r"[\"“”]"), lambda m, n, e: "[\"“”]"),
+    # The Code drops the enacting "That" that opens a section, and "hereby": "That the Secretary … be, and he
+    # is hereby, empowered" prints as "The Secretary … be, and he is empowered".
+    # Without "That", the next word starts the sentence, so it's capitalized.
+    (re.compile(r"That ([a-z])"),
+     lambda m, n, e: f"(?:That {m[1]}|{m[1].upper()})" if m.start() == 0 else None),
+    (re.compile(r" hereby,?(?= )"), lambda m, n, e: r"(?: hereby,?)?"),
+    # It adds Code citations in brackets after a law it names: "…, as amended [25 U.S.C. 5101 et seq.];".
+    (re.compile(r"\)|as amended\b"), lambda m, n, e: re.escape(m[0]) + r"(?: \[[^\]]*U\.S\.C\.[^\]]*\])?"),
+]
+
+
+def _code_wording(phrase: str, numbers: dict[str, str]) -> str | None:
+    """A regex accepting the phrase as the Code's editors may print it, or None when there's no rewording
+    to allow for."""
+    out, pos, changed = [], 0, False
+    while pos < len(phrase):
+        for pattern, build in _CODE_WORDING:
+            match = pattern.match(phrase, pos)
+            if not match or not match.group(0):
+                continue
+            piece = build(match, numbers, match.end() == len(phrase))
+            if piece is None:
+                continue
+            out.append(piece)
+            changed = changed or piece != re.escape(match.group(0))
+            pos = match.end()
+            break
+        else:
+            out.append(re.escape(phrase[pos]))
+            pos += 1
+    if not changed:
+        return None
+    before = r"(?<!\w)" if phrase[:1].isalnum() else ""
+    after = r"(?!\w)" if phrase[-1:].isalnum() else ""
+    return before + "".join(out) + after
 
 
 _UNIT_ABBREVIATIONS = {"part": r"pt\.", "title": "title", "subtitle": "subtitle"}
@@ -63,7 +163,8 @@ def _act_name(name: str) -> str:
     the Federal Power Act."""
     return re.sub(r"^(?:(?:Part|Title|Subtitle) \w+ of )?(?:the )?", "", name)
 
-_SUBDIVISION_ACTIONS =("delete_nodes", "replace_nodes", "redesignate", "insert_after_node", "add_at_end")
+_SUBDIVISION_ACTIONS =("delete_nodes", "replace_nodes", "redesignate", "insert_after_node", "insert_before_node",
+                       "add_at_end")
 
 
 def _ends_with_inline(node: Node, value: str) -> bool:
@@ -92,6 +193,11 @@ def _sentences(text: str) -> list[tuple[int, int]]:
         start = match.end()
     spans.append((start, len(text.rstrip())))
     return spans
+
+
+# Where the Code runs two of an Act's definitions together with a comma, as 30 U.S.C. 351 does with the Act's
+# "… the Secretary of the Interior. “Mineral leasing laws” shall mean …".
+_JOINED_DEFINITION = re.compile(r", (?=“([A-Z][^”]*)” (?:shall mean|means|shall include|includes?|shall embrace)\b)")
 
 
 def _ordinal(n: int) -> str:
@@ -127,6 +233,8 @@ class Engine:
         self.units: dict[str, tuple[str, str] | None] = {}  # the part or title each new section was added to
         self.act_names: dict[str, tuple] = {}  # Act names found in this bill, to the Acts they cite
         self.undo: dict[str, list] | None = None  # document states to restore if an "in each of" fails
+        # Notes that the Code's wording was matched, kept until the instruction applies.
+        self.reworded: list[tuple] = []
 
     def run(self) -> Outcome:
         for problem in self.bill.problems:
@@ -134,11 +242,17 @@ class Engine:
             self.outcome.unredlined.append(Unredlined(problem.cite, problem.raw, problem.reason))
             self._flag(problem.cite, f"Not applied: {problem.reason}. See the list of instructions not redlined.")
         for instruction in self.bill.instructions:
+            self.reworded = []
             try:
                 ok = self._apply(instruction)
             except _NotApplied as err:
                 self._flag(instruction.cite, str(err), doc=err.doc, node=err.node)
                 ok = False
+            if ok:
+                notes = {(message, id(doc), id(node)): (message, blocking, doc, node)
+                         for message, blocking, doc, node in self.reworded}
+                for note in notes.values():
+                    self._flag(instruction.cite, *note)
             if ok:
                 self.outcome.applied += 1
             else:
@@ -179,15 +293,19 @@ class Engine:
         self.act_names.setdefault(name, key)
         return self.acts[key]
 
-    def _note(self, target: Target) -> Document | None:
-        key = f"{target.name}|{target.cite}|{target.section}"
+    def _note(self, target: Target, path: list) -> tuple[Document | None, int]:
+        """The Code note for a target, and how many leading steps of the path the note itself stands for,
+        when it reproduces only part of a section."""
+        values = tuple(step[1] for step in path if isinstance(step[1], str))
+        key = f"{target.name}|{target.cite}|{target.section}|{values}"
         if key in self.notes:
             return self.notes[key]
-        doc = None
+        doc, depth = None, 0
         if target.public_law:
             for title in self.titles.values():
-                doc = title.note_for_public_law(target.public_law, target.section or "")
-                if doc:
+                found = title.note_for_public_law(target.public_law, target.section or "", values)
+                if found:
+                    doc, depth = found
                     break
         if doc is None and target.usc_section:
             title = self.titles.get(target.title)
@@ -195,8 +313,8 @@ class Engine:
                 doc = title.note_for_act(target.usc_section, target.name)
         if doc is not None:
             doc = self.docs.setdefault(doc.key, doc)
-            self.notes[key] = doc
-        return doc
+            self.notes[key] = doc, depth
+        return doc, depth
 
     def _direct(self, target: Target) -> Document | None:
         title = self.titles.get(target.title)
@@ -236,6 +354,8 @@ class Engine:
         target = inst.target
         if target.is_note:
             return self._apply_note(inst)
+        if target.chapter and target.toc:
+            return self._apply_toc(inst)
         if target.chapter:
             return self._apply_chapter(inst)
         if target.name.startswith("title "):
@@ -246,11 +366,12 @@ class Engine:
         return self._apply_act(inst)
 
     def _apply_note(self, inst: Instruction) -> bool:
-        doc = self._note(inst.target)
+        path = list(inst.target.path) + inst.path
+        doc, depth = self._note(inst.target, path)
         if doc is None:
             return self._not_redlined(inst, f"{inst.target.name} wasn't found in the Code notes")
         root = doc.root
-        path = list(inst.target.path) + inst.path
+        path = path[depth:]
         section = root.live_child(inst.target.section or "", "section")
         if section is not None:
             root = section
@@ -333,14 +454,40 @@ class Engine:
             return self._replace_at_end(inst, doc, node)
         if action == "replace_span":
             return self._replace_span(inst, doc, node)
+        if action == "replace_across":
+            return self._replace_across(inst, doc, node)
         if action in ("replace_sentence", "insert_after_sentence"):
             return self._edit_sentence(inst, doc, node)
+        if action == "replace_sentence_with_block":
+            return self._replace_sentence_with_block(inst, doc, node)
+        if action == "insert_term_heading":
+            return self._insert_term_heading(inst, doc, node)
         if action == "delete_nodes":
             for child in self._children(inst, doc, node, args["values"], args["kind"]):
                 child.delete(inst.cite)
             return True
         if action == "redesignate":
             return self._redesignate(inst, doc, node)
+        if action == "reorder":
+            return self._reorder(inst, doc, node)
+        if action == "insert_at_start":
+            # "By inserting “The term” after the paragraph designation": the start of the provision's text.
+            if node.kind != inst.args["unit"] or not node.body.current():
+                raise _NotApplied(f"Not applied: {_describe(node, doc)} isn't a {inst.args['unit']} with text after "
+                                  "its designation.", doc, node)
+            node.body.insert(0, f"{inst.args['new']} ", (inst.cite,))
+            return True
+        if action == "indent":
+            # The words don't change, and the redline indents each subdivision by its level, so there's
+            # nothing to mark. The subdivisions are still checked, so a wrong reference isn't counted.
+            values = args["values"]
+            self._children(inst, doc, node, values, args["kind"])
+            names = f"{args['kind']}s ({values[0]}) through ({values[-1]})" if len(values) > 1 \
+                else f"{args['kind']} ({values[0]})"
+            self._flag(inst.cite, f"Indentation only: the instruction moves {names} of "
+                                  f"{_describe(node, doc)} without changing their words. The redline sets "
+                                  "indentation by level, so no change is shown.", False, doc, node)
+            return True
         if action == "replace_nodes":
             targets = self._children(inst, doc, node, args["values"], args["kind"])
             position = node.children.index(targets[-1]) + 1
@@ -366,12 +513,17 @@ class Engine:
             node.children.extend(args["blocks"])
             self._check_duplicates(inst, doc, node)
             return True
-        if action == "insert_after_node":
+        if action in ("insert_after_node", "insert_before_node"):
             targets = self._children(inst, doc, node, args["values"], args["kind"])
-            position = node.children.index(targets[-1]) + 1
+            position = node.children.index(targets[-1]) + 1 if action == "insert_after_node" \
+                else node.children.index(targets[0])
             node.children[position:position] = args["blocks"]
             self._check_duplicates(inst, doc, node)
             return True
+        if action == "replace_at_end_with_block":
+            return self._replace_at_end_with_block(inst, doc, node)
+        if action == "add_text_at_end":
+            return self._add_text_at_end(inst, doc, node)
         raise _NotApplied(f"Not applied: no handler for '{action}'.", doc, node)
 
     def _children(self, inst, doc, node, values, kind) -> list[Node]:
@@ -391,7 +543,14 @@ class Engine:
         windows = [(t, 0, len(t.current())) for t in node.texts(headings=False) if t.current()]
         for part in inst.within:
             if part[0] == "sentence":
-                windows = [self._sentence(self._sentence_base(windows, part[1], doc, node), part[1], doc, node)]
+                base = self._sentence_base(windows, part[1], doc, node, inst)
+                try:
+                    windows = [self._sentence(base, part[1], doc, node)]
+                except _NotApplied:
+                    windows = [self._sentence_by_text(inst, base, part[1], doc, node)]
+                continue
+            if part[0] == "proviso":
+                windows = [self._proviso(windows, part[1], doc, node)]
                 continue
             where, kind, value = part
             live = [c for c in node.children if not c.deleted]
@@ -411,32 +570,123 @@ class Engine:
             windows = [(text, 0, len(text.current()))]
         return windows
 
-    def _sentence_base(self, windows, n, doc, node) -> tuple[Text, int, int]:
+    def _proviso(self, windows, n, doc, node) -> tuple[Text, int, int]:
+        """The nth proviso: from its "Provided" to the next proviso or the end of that block of text."""
+        starts = [(text, m.start(), end) for text, start, end in windows
+                  for m in re.finditer(r"\bProvided(?:,? (?:further|however|also))*,? [Tt]hat\b", text.current())
+                  if start <= m.start() < end]
+        if n > len(starts) or not starts:
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't have a {_ordinal(n)} proviso "
+                              f"(it has {len(starts)}).", doc, node)
+        text, begin, end = starts[n - 1 if n > 0 else -1]
+        following = [s for t, s, _ in starts if t is text and s > begin]
+        return text, begin, following[0] if following else end
+
+    def _sentence_base(self, windows, n, doc, node, inst=None) -> tuple[Text, int, int]:
         """The window that sentence n is counted in. With subdivisions, that's the introductory text, which
-        comes first, so it's only clear when the count stays within it."""
+        comes first, so it's only clear when the count stays within it, or when the quoted text is only there:
+        the Code may join the Act's sentences, so it has fewer than the bill counts (see _sentence_by_text)."""
         if len(windows) == 1:
             return windows[0]
         body = node.body.current()
-        if n > 0 and body and len(_sentences(body)) >= n:
+        if n > 0 and body and len(self._counted(body, n, doc, node)) >= n:
+            return (node.body, 0, len(body))
+        phrase = inst and (inst.args.get("old") or inst.args.get("start"))
+        hits = self._hits(phrase, windows) if phrase and n > 0 and body else []
+        if hits and all(text is node.body for text, _ in hits):
             return (node.body, 0, len(body))
         raise _NotApplied(f"Not applied: {_describe(node, doc)} has subdivisions, so it isn't clear which text "
                           "the sentence count starts from.", doc, node)
 
     def _sentence(self, window, n, doc, node) -> tuple[Text, int, int]:
         text, start, end = window
-        spans = [(start + a, start + b) for a, b in _sentences(text.current()[start:end])]
+        spans = [(start + a, start + b) for a, b in self._counted(text.current()[start:end], n, doc, node)]
         if n > len(spans) or (n == -1 and len(spans) < 2):
             raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't have a {_ordinal(n)} sentence "
                               f"(it has {len(spans)}).", doc, node)
         return (text, *spans[n - 1 if n > 0 else -1])
 
+    def _counted(self, text: str, n: int, doc, node) -> list[tuple[int, int]]:
+        """The sentences of text, as the bill counts them to reach sentence n. When the Code has too few and
+        the shortfall is exactly the number of definitions it runs together with a comma, it's counted as
+        though those were the Act's periods, and the count is noted for review."""
+        spans = _sentences(text)
+        if n < 1 or n <= len(spans):
+            return spans
+        joins = list(_JOINED_DEFINITION.finditer(text))
+        if len(joins) != n - len(spans):
+            return spans
+        split = []
+        for a, b in spans:
+            for m in joins:
+                if a < m.start() < b:  # the comma ends a sentence, and the next starts at the quote
+                    split.append((a, m.start() + 1))
+                    a = m.end()
+            split.append((a, b))
+        terms = " and ".join(f"“{m.group(1)}”" for m in joins)
+        self.reworded.append((f"The Code runs sentences of {_describe(node, doc)} together with a comma before "
+                              f"{terms}, where the Act has a period, so it has {len(spans)} sentences where the "
+                              f"bill counts at least {n}. Counted as the Act's sentences. Check the match.",
+                              False, doc, node))
+        return split
+
+    def _sentence_by_text(self, inst, window, n, doc, node) -> tuple[Text, int, int]:
+        """When the Code has fewer sentences than the bill counts, the one sentence holding the quoted text.
+        The Code sometimes joins the Act's sentences: 30 U.S.C. 351 runs the Act's "… the Secretary of the
+        Interior. “Mineral leasing laws” shall mean …" together with a comma, so the Act's sixth sentence is
+        the Code's fifth (S. 5653 § 2215(c)(1)(A))."""
+        phrase = inst.args.get("old") or inst.args.get("start")
+        text, start, end = window
+        spans = [(start + a, start + b) for a, b in _sentences(text.current()[start:end])]
+        holding = [s for s in spans if self._hits(phrase, [(text, *s)])] if phrase else []
+        if n < 1 or len(holding) != 1:
+            return self._sentence(window, n, doc, node)  # raises, with the count
+        place = spans.index(holding[0]) + 1
+        self.reworded.append((f"The bill's “{phrase}” is in the {_ordinal(n)} sentence, but the Code prints it in "
+                              f"the {_ordinal(place)} sentence of {_describe(node, doc)}, which has only "
+                              f"{len(spans)}. The Code may join sentences of the Act. Applied there. Check the "
+                              "match.", False, doc, node))
+        return (text, *holding[0])
+
     def _hits(self, phrase, windows, ignore_case=False) -> list[tuple[Text, re.Match]]:
         return [(text, m) for text, start, end in windows for m in _word_matches(phrase, text.current(), ignore_case)
                 if start <= m.start() and m.end() <= end]
 
+    def _find(self, inst, phrase, windows, doc, node, ignore_case=False) -> list[tuple[Text, re.Match]]:
+        """Matches of the bill's phrase. When there are none, the phrase as the Code's editors may have
+        printed it, as in "section 1532(13) of this title" for the Act's "section 3(13) of this Act", if
+        that matches exactly once. The match is then noted for review."""
+        hits = self._hits(phrase, windows, ignore_case)
+        if hits:
+            return hits
+        pattern = _code_wording(phrase, self._numbers(inst))
+        if pattern is None:
+            return []
+        flags = re.IGNORECASE if ignore_case else 0
+        hits = [(text, m) for text, start, end in windows for m in re.finditer(pattern, text.current(), flags)
+                if start <= m.start() and m.end() <= end]
+        if len(hits) == 1:
+            self.reworded.append((f"The Code prints “{hits[0][1].group(0)}” where the bill quotes the Act's "
+                                  f"“{phrase}”. Applied to the Code's wording; any new text is the bill's, as "
+                                  "worded for the Act. Check the match.", False, doc, node))
+            return hits
+        return []
+
+    def _numbers(self, inst) -> dict[str, str]:
+        """The Act's section numbers mapped to their Code sections, for an instruction amending an Act."""
+        target = inst.target
+        if target.is_note or target.chapter or target.name.startswith("title "):
+            return {}
+        act = self._act(target)
+        if act is None:
+            return {}
+        codes = {number: doc.key.split("usc", 1)[1] for number, doc in act.sections.items()
+                 if doc.basis == "code" and "usc" in doc.key}  # not the sections the bill adds
+        return {number: code for number, code in codes.items() if code != number}
+
     def _replace_once(self, inst, doc, node) -> bool:
         old, new = inst.args["old"], inst.args["new"]
-        hits = self._hits(old, self._scope(inst, doc, node), inst.heading)
+        hits = self._find(inst, old, self._scope(inst, doc, node), doc, node, inst.heading)
         if not hits:
             raise _NotApplied(f"Not applied: “{old}” wasn't found in {_describe(node, doc)}. "
                               "The Code's wording may differ from the Act's.", doc, node)
@@ -444,7 +694,7 @@ class Engine:
             raise _NotApplied(f"Not applied: “{old}” appears {len(hits)} times in {_describe(node, doc)}, "
                               "and the instruction doesn't say which one.", doc, node)
         text, match = hits[0]
-        if match.group(0) != old:
+        if match.group(0) != old and match.group(0).lower() == old.lower():
             self._flag(inst.cite, f"The text “{match.group(0)}” differs in capitalization from the bill's "
                                   f"“{old}”. Applied, using the bill's capitalization for the new text.",
                        False, doc, node)
@@ -498,11 +748,117 @@ class Engine:
         _swap(text, start, len(current), new, inst.cite)
         return True
 
+    def _replace_across(self, inst, doc, node) -> bool:
+        """'By striking "the later of" in the matter preceding subclause (I) and all that follows through the
+        semicolon at the end of subclause (II)': from text before the first subdivision into a later one. The
+        rest of the introductory text and the subdivisions before the last go. The last one goes too, or, when
+        the span ends partway into it, its designation and its text up to there, and the rest runs on."""
+        args = inst.args
+        live = [c for c in node.children if not c.deleted and c.kind != "continuation"]
+        first_kind, first_value = args["first"]
+        if not live or (live[0].kind, live[0].value) != (first_kind, first_value):
+            raise _NotApplied(f"Not applied: {first_kind} ({first_value}) isn't the first subdivision of "
+                              f"{_describe(node, doc)}.", doc, node)
+        last = node.live_child(args["last"][1], args["last"][0])
+        if last is None:
+            raise _NotApplied(f"Not applied: {args['last'][0]} ({args['last'][1]}) wasn't found under "
+                              f"{_describe(node, doc)}.", doc, node)
+        if any(not c.deleted for c in last.children):
+            raise _NotApplied(f"Not applied: the span ends in {_describe(last, doc)}, which has subdivisions of its "
+                              "own.", doc, node)
+        intro = node.body
+        hits = self._find(inst, args["start"], [(intro, 0, len(intro.current()))], doc, node)
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{args['start']}” {problem} in the matter preceding {first_kind} "
+                              f"({first_value}) of {_describe(node, doc)}.", doc, node)
+        body = last.body.current()
+        if args["end"] is None:
+            if not body.rstrip().endswith(args["end_punct"]):
+                raise _NotApplied(f"Not applied: {_describe(last, doc)} doesn't end with “{args['end_punct']}”.",
+                                  doc, node)
+            stop = len(body)
+        else:
+            label = last.label.current().strip()
+            end = args["end"]
+            if label and end.startswith(label) and body.startswith(end[len(label):].lstrip()):
+                stop = len(end[len(label):].lstrip())  # "(A) the": the designation and the first word
+            else:
+                ends = self._find(inst, end, [(last.body, 0, len(body))], doc, node)
+                if len(ends) != 1:
+                    raise _NotApplied(f"Not applied: “{end}” wasn't found exactly once in {_describe(last, doc)}.",
+                                      doc, node)
+                stop = ends[0][1].end()
+        _swap(intro, hits[0][1].start(), len(intro.current()), args["new"], inst.cite)
+        for child in node.children[:next(i for i, c in enumerate(node.children) if c is last)]:
+            if not child.deleted:
+                child.delete(inst.cite)
+        if not body[stop:].strip():
+            last.delete(inst.cite)
+            return True
+        last.label.delete_all(inst.cite)
+        last.heading.delete_all(inst.cite)
+        last.body.strike(0, stop, inst.cite)
+        last.run_in = True
+        return True
+
+    def _replace_at_end_with_block(self, inst, doc, node) -> bool:
+        """'By striking the period at the end and inserting the following: “, except that—” (A) … (B) …'.
+        The end punctuation gives way to the run-in text, and the new subdivisions follow: under the
+        provision when it has none, after its last subdivision when they're at that level, or after the
+        provision itself when they're at its own level, as in 'in subparagraph (A), by striking the period at
+        the end and inserting “; and” (B) …'."""
+        old, lead, blocks = inst.args["old"], inst.args["lead"], inst.args["blocks"]
+        if inst.within:
+            raise _NotApplied("Not applied: an edit at the end of only part of a provision isn't supported.", doc, node)
+        live = [c for c in node.children if not c.deleted and c.kind != "continuation"]
+        if node.tail.current():
+            raise _NotApplied(f"Not applied: text follows the subdivisions of {_describe(node, doc)}, so it isn't "
+                              "clear where the new subdivisions go.", doc, node)
+        kind = blocks[0].kind
+        parent, position = node, len(node.children)
+        if kind == node.kind and node is not doc.root:
+            parent = next((p for p in _walk_nodes(doc.root) if node in p.children), None)
+            fits = parent is not None
+            position = parent.children.index(node) + 1 if fits else 0
+        elif live:
+            fits = kind == live[-1].kind
+        else:
+            fits = node.kind not in LEVELS or (kind in LEVELS and LEVELS.index(kind) > LEVELS.index(node.kind))
+        if not fits or any(b.kind != kind for b in blocks):
+            raise _NotApplied(f"Not applied: the new {blocks[0].kind} doesn't fit at the end of "
+                              f"{_describe(node, doc)}.", doc, node)
+        texts = [t for t in node.texts(headings=False) if t.current()]
+        text = texts[-1] if texts else None
+        current = text.current().rstrip() if text else ""
+        if not current.endswith(old):
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't end with “{old}”.", doc, node)
+        _swap(text, len(current) - len(old), len(current), lead, inst.cite)
+        parent.children[position:position] = blocks
+        self._check_duplicates(inst, doc, parent)
+        return True
+
+    def _add_text_at_end(self, inst, doc, node) -> bool:
+        """'By adding at the end the following: “…”' with text rather than new subdivisions: a sentence
+        added to the provision's text."""
+        if inst.within or inst.heading:
+            raise _NotApplied("Not applied: adding text at the end of only part of a provision isn't supported.",
+                              doc, node)
+        live = [c for c in node.children if not c.deleted]
+        text = node.tail if live else node.body
+        if live and not text.current():
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} ends with subdivisions, so it isn't clear where "
+                              "the new text goes.", doc, node)
+        current = text.current()
+        end = len(current.rstrip())
+        text.insert(end, f" {inst.args['new']}" if end else inst.args["new"], (inst.cite,))
+        return True
+
     def _replace_span(self, inst, doc, node) -> bool:
         """'By striking "A" and all that follows through "B"', within one block of text."""
         start, end, new = inst.args["start"], inst.args["end"], inst.args["new"]
         windows = self._scope(inst, doc, node)
-        hits = self._hits(start, windows)
+        hits = self._find(inst, start, windows, doc, node)
         if len(hits) != 1:
             problem = "wasn't found" if not hits else f"appears {len(hits)} times"
             raise _NotApplied(f"Not applied: “{start}” {problem} in {_describe(node, doc)}.", doc, node)
@@ -510,11 +866,11 @@ class Engine:
         limit = next(e for t, s, e in windows if t is text and s <= match.start() and match.end() <= e)
         current = text.current()
         if end is not None:
-            ends = _word_matches(end, current[match.end():limit])
+            ends = [m for _, m in self._find(inst, end, [(text, match.end(), limit)], doc, node)]
             if not ends:
                 raise _NotApplied(f"Not applied: “{end}” wasn't found after “{start}” in the same block of text "
                                   f"in {_describe(node, doc)}.", doc, node)
-            stop = match.end() + ends[0].end()
+            stop = ends[0].end()
         else:
             # "The period at the end" is the end of the window: a sentence, if the instruction names one.
             punct = inst.args["end_punct"]
@@ -530,10 +886,19 @@ class Engine:
         """'By striking "X" and inserting the following:' with new subdivisions. Bills use this to break
         existing text into subdivisions: the struck text is replaced by the new ones, and the text that
         followed it continues as the text of the last of them."""
-        old, blocks = inst.args["old"], inst.args["blocks"]
-        if not old.startswith("("):
-            self._split_into(inst, doc, node, old, blocks, at_start=False)
+        old, blocks, lead = inst.args["old"], inst.args["blocks"], inst.args.get("lead", "")
+        if inst.args.get("through"):
+            # A span, "X" and all that follows through "Y", is only ever split into new subdivisions.
+            self._split_into(inst, doc, node, old, blocks, at_start=False, lead=lead)
             return True
+        if node is doc.root and len(blocks) == 1 and blocks[0].kind == node.kind == "section" and not lead:
+            return self._restate_section(inst, doc, node, old, blocks[0])
+        if not old.startswith("("):
+            self._split_into(inst, doc, node, old, blocks, at_start=False, lead=lead)
+            return True
+        if lead:
+            raise _NotApplied("Not applied: the struck text starts with a designation, and the new text has run-in "
+                              "text before its subdivisions.", doc, node)
         # Struck text that begins with a designation, as in "(e)(1) In carrying", restructures that
         # provision in place, adding headings and new levels under it.
         if len(blocks) != 1:
@@ -542,10 +907,43 @@ class Engine:
         block = blocks[0]
         target = next((n for n in [node] + [c for c in node.children if not c.deleted]
                        if (n.kind, n.value) == (block.kind, block.value)), None)
+        if target is None and block.kind == node.kind and node is not doc.root and node.label.current().strip()                 and old.startswith(node.label.current().strip()):
+            # 'In subsection (t), by striking "(t) Nothing in this section" and inserting (u) Savings provision.—
+            # Nothing in this section': the struck designation gives way to the new one.
+            self._overlay(inst, doc, node, old, block)
+            node.renumber(block.value, inst.cite)
+            parent = next((p for p in _walk_nodes(doc.root) if node in p.children), None)
+            if parent is not None:
+                self._check_duplicates(inst, doc, parent)
+            return True
         if target is None:
             raise _NotApplied(f"Not applied: the new {block.kind} ({block.value}) doesn't match {_describe(node, doc)} "
                               "or any of its subdivisions.", doc, node)
         self._overlay(inst, doc, target, old, block)
+        return True
+
+    def _restate_section(self, inst, doc, node, old, block) -> bool:
+        """'In the first section, by striking "That the Secretary … empowered to" and inserting SEC. 1.
+        Rights-of-way … The Secretary of the Interior may' (S. 5653 § 2212(1)): the new section is the same
+        one, with a heading and new opening words. The heading replaces the section's, and the new words
+        replace the struck ones; the rest of the text stays."""
+        unlabeled = [c for c in block.children if not c.label.current() and not c.heading.current()]
+        if block.body.current() and not block.children:
+            words = block.body
+        elif not block.body.current() and len(block.children) == 1 and unlabeled and not unlabeled[0].children:
+            words = unlabeled[0].body  # bills set a section's text out as a subsection with no designation
+        else:
+            raise _NotApplied(f"Not applied: the new section has subdivisions, so it doesn't just restate the opening "
+                              f"of {_describe(node, doc)}.", doc, node)
+        hits = self._find(inst, old, self._scope(inst, doc, node), doc, node)
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{old}” {problem} in {_describe(node, doc)}.", doc, node)
+        text, match = hits[0]
+        if block.heading.current() and block.heading.current() != node.heading.current():
+            node.heading.delete_all(inst.cite)
+            node.heading.segments += block.heading.segments
+        _swap(text, match.start(), match.end(), words.current(), inst.cite)
         return True
 
     def _overlay(self, inst, doc, node, old, block) -> None:
@@ -623,10 +1021,14 @@ class Engine:
         self._check_duplicates(inst, doc, node)
         return True
 
-    def _split_into(self, inst, doc, node, old, blocks, at_start) -> None:
+    def _split_into(self, inst, doc, node, old, blocks, at_start, lead="", span=None) -> None:
         """Strike old from node's introductory text and put blocks in its place as new subdivisions, moving
-        the text that followed old into the last of them. New provisions at node's own level, as in 'in
-        paragraph (1), by striking "to promote" and inserting (2) to promote', follow node instead."""
+        the text that followed old into the last of them. Run-in text the new subdivisions follow, as in
+        "the Secretary—", takes old's place. New provisions at node's own level, as in 'in
+        paragraph (1), by striking "to promote" and inserting (2) to promote', follow node instead. span,
+        (start, stop) in node's introductory text, is struck text already found, such as a whole sentence."""
+        if inst.within and inst.within[-1][0] == "following":
+            return self._split_trailing(inst, doc, node, old, blocks, lead)
         if any(c.label.before() for c in node.children if not c.deleted):
             raise _NotApplied(f"Not applied: {_describe(node, doc)} already has subdivisions, and the instruction "
                               "doesn't say whether they move under the new ones.", doc, node)
@@ -636,16 +1038,16 @@ class Engine:
             raise _NotApplied(f"Not applied: the new {blocks[0].kind} can't go inside {_describe(node, doc)}.",
                               doc, node)
         text = node.body
-        windows = [w for w in self._scope(inst, doc, node) if w[0] is text]
-        hits = self._hits(old, windows)
-        if at_start:
-            hits = [(t, m) for t, m in hits if m.start() == 0]
-        if len(hits) != 1:
-            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
-            raise _NotApplied(f"Not applied: “{old}” {problem} in the text of {_describe(node, doc)}.", doc, node)
-        match = hits[0][1]
-        text.strike(match.start(), match.end(), inst.cite)
-        rest = text.cut(match.start())
+        if span is None:
+            begin, stop = self._split_span(inst, doc, node, old, at_start)
+        else:
+            begin, stop = span
+        text.strike(begin, stop, inst.cite)
+        if lead[:1] == "(" and text.current()[begin - 1:begin].isalnum():
+            lead = " " + lead  # a citation run in after a word, as in "Act of 2005 (43 U.S.C. 1337 note)"
+        if lead:
+            text.insert(begin, lead, (inst.cite,))
+        rest = text.cut(begin + len(lead))
         last = blocks[-1]
         while last.children:
             last = last.children[-1]
@@ -655,8 +1057,66 @@ class Engine:
             parent.children[position:position] = blocks
             self._check_duplicates(inst, doc, parent)
             return
-        node.children[0:0] = blocks
-        self._check_duplicates(inst, doc, node)
+        container = _container_for(blocks[-1], node.children)
+        if container is None:
+            node.children[0:0] = blocks
+            self._check_duplicates(inst, doc, node)
+            return
+        # Subdivisions an earlier instruction split off from later text follow the moved text in reading
+        # order, so they go under the new subdivision that holds it: in 54 U.S.C. 306108, the new (2) split
+        # from the second sentence belongs in the (b) later split from the first, after (b)(1).
+        container.children.extend(node.children)
+        node.children = blocks
+        self._check_duplicates(inst, doc, container)
+
+    def _split_span(self, inst, doc, node, old, at_start) -> tuple[int, int]:
+        """Where old is in node's introductory text, through the instruction's "through" phrase if any."""
+        text = node.body
+        windows = [w for w in self._scope(inst, doc, node) if w[0] is text]
+        hits = self._find(inst, old, windows, doc, node)
+        if at_start:
+            hits = [(t, m) for t, m in hits if m.start() == 0]
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{old}” {problem} in the text of {_describe(node, doc)}.", doc, node)
+        match = hits[0][1]
+        through = inst.args.get("through")
+        if not through:
+            return match.start(), match.end()
+        limit = next(e for t, s, e in windows if s <= match.start() and match.end() <= e)
+        ends = self._find(inst, through, [(text, match.end(), limit)], doc, node)
+        if not ends:
+            raise _NotApplied(f"Not applied: “{through}” wasn't found after “{old}” in the text of "
+                              f"{_describe(node, doc)}.", doc, node)
+        return match.start(), ends[0][1].end()
+
+    def _split_trailing(self, inst, doc, node, old, blocks, lead) -> None:
+        """'In the matter following clause (ii), by striking "The Secretary" and inserting (C) The Secretary':
+        the text after a provision's last subdivision, from old on, becomes new provisions at its own level,
+        right after it. The subdivisions stay where they are."""
+        windows = self._scope(inst, doc, node)
+        text = windows[0][0]
+        parent = next((p for p in _walk_nodes(doc.root) if node in p.children), None)
+        if text is not node.tail or parent is None or any(b.kind != node.kind for b in blocks):
+            raise _NotApplied(f"Not applied: only the matter after the last subdivision of {_describe(node, doc)} "
+                              f"can become a new {node.kind} after it.", doc, node)
+        hits = self._find(inst, old, windows, doc, node)
+        if len(hits) != 1:
+            problem = "wasn't found" if not hits else f"appears {len(hits)} times"
+            raise _NotApplied(f"Not applied: “{old}” {problem} in the matter following the subdivisions of "
+                              f"{_describe(node, doc)}.", doc, node)
+        match = hits[0][1]
+        text.strike(match.start(), match.end(), inst.cite)
+        if lead:
+            text.insert(match.start(), lead, (inst.cite,))
+        rest = text.cut(match.start() + len(lead))
+        last = blocks[-1]
+        while last.children:
+            last = last.children[-1]
+        last.body.segments += rest.segments
+        position = parent.children.index(node) + 1
+        parent.children[position:position] = blocks
+        self._check_duplicates(inst, doc, parent)
 
     def _edit_sentence(self, inst, doc, node) -> bool:
         """'By striking the second sentence', 'by inserting after the first sentence the following: "…"'."""
@@ -669,9 +1129,46 @@ class Engine:
             _swap(text, start, end, new, inst.cite)
         return True
 
+    def _replace_sentence_with_block(self, inst, doc, node) -> bool:
+        """'By striking the fourth sentence and inserting the following: (4) Mineral leasing laws.— …'
+        (S. 5653 § 2215(c)(1)(C)). The sentence gives way to the new subdivisions, as struck text does in
+        _split_into."""
+        n = inst.args["n"]
+        text, start, end = self._sentence(self._sentence_base(self._scope(inst, doc, node), n, doc, node), n, doc, node)
+        if text is not node.body:
+            raise _NotApplied(f"Not applied: the {_ordinal(n)} sentence isn't in the introductory text of "
+                              f"{_describe(node, doc)}, so the new subdivisions have no place there.", doc, node)
+        self._split_into(inst, doc, node, text.current()[start:end], inst.args["blocks"], at_start=False,
+                         lead=inst.args.get("lead", ""), span=(start, end))
+        return True
+
+    def _insert_term_heading(self, inst, doc, node) -> bool:
+        """'By inserting a paragraph heading, the text of which comprises the term defined in that paragraph'
+        (S. 5653 § 2222(a)(1)(G)(ii)). The heading is the term the provision's opening defines, capitalized as
+        bills write headings; two or more terms are joined with semicolons, as in the bill's own "Acquired
+        lands; lands acquired by the United States"."""
+        unit = inst.args["unit"]
+        if node.kind != unit:
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} isn't a {unit}.", doc, node)
+        if node.heading.current().strip():
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} already has a heading.", doc, node)
+        quoted = r"“[^“”]+”"
+        match = re.match(rf"(?:The terms? )?({quoted}(?:(?:,? and|,? or|,) {quoted})*)", node.body.current())
+        if match is None:
+            raise _NotApplied(f"Not applied: {_describe(node, doc)} doesn't open with the term it defines, so "
+                              "there's no term for its heading.", doc, node)
+        terms = re.findall(r"“([^“”]+)”", match.group(1))
+        heading = "; ".join(terms)
+        heading = heading[:1].upper() + heading[1:]
+        node.heading.insert(0, heading, (inst.cite,))
+        self.outcome.term_headings.append((node, heading))
+        self.reworded.append((f"The heading “{heading}” isn't quoted in the bill: it's the term {_describe(node, doc)} "
+                              "defines, as the instruction directs, taken from its text. Check it.", False, doc, node))
+        return True
+
     def _insert_text(self, inst, doc, node) -> bool:
         anchor, new = inst.args["anchor"], inst.args["new"]
-        hits = self._hits(anchor, self._scope(inst, doc, node))
+        hits = self._find(inst, anchor, self._scope(inst, doc, node), doc, node)
         if len(hits) != 1:
             problem = "wasn't found" if not hits else f"appears {len(hits)} times"
             raise _NotApplied(f"Not applied: the anchor “{anchor}” {problem} in {_describe(node, doc)}.", doc, node)
@@ -701,10 +1198,87 @@ class Engine:
         kind, old, new = inst.args["kind"], inst.args["old"], inst.args["new"]
         if len(old) != len(new):
             raise _NotApplied("Not applied: the old and new designations don't line up.", doc, node)
+        if not any(node.live_child(value, kind) for value in old) and not inst.args.get("reorder"):
+            found = self._run_in(inst, doc, node, old)
+            if found:
+                return self._redesignate_run_in(inst, doc, node, found)
         targets = self._children(inst, doc, node, old, kind)
+        new_kind = inst.args.get("new_kind", kind)
         for child, value in zip(targets, new):
             child.renumber(value, inst.cite)
+            # "Subsections (a) through (g) as paragraphs (8), (4), …" makes them paragraphs, which also sets
+            # their indentation.
+            if new_kind != child.kind:
+                child.original_kind = child.original_kind or child.kind
+                child.kind = new_kind
         self._check_duplicates(inst, doc, node)
+        if inst.args.get("reorder") and self._move_into_order(node, new_kind, inst.cite) is None:
+            raise _NotApplied(f"Not applied: the {new_kind}s of {_describe(node, doc)} can't be put in order by "
+                              "their designations.", doc, node)
+        return True
+
+    def _run_in(self, inst, doc, node, old) -> list[tuple[Text, re.Match]] | None:
+        """Designations run into the provision's text, as in 16 U.S.C. 1536(n): "…for (1) any circuit …, or
+        (2) in any case …". Each must appear exactly once, standing alone, and in order."""
+        own = {id(node.body), id(node.tail)} | {id(c.body) for c in node.children if c.kind == "continuation"}
+        windows = [w for w in self._scope(inst, doc, node) if id(w[0]) in own]
+        found = []
+        for value in old:
+            pattern = rf"(?<![\w)\]]){re.escape(f'({value})')}(?= )"
+            hits = [(text, m) for text, start, end in windows
+                    for m in re.finditer(pattern, text.current()) if start <= m.start() and m.end() <= end]
+            if len(hits) != 1:
+                return None
+            found.append(hits[0])
+        texts = [text for text, _ in found]
+        if any(t is not texts[0] for t in texts) or [m.start() for _, m in found] != sorted(m.start() for _, m in found):
+            return None
+        return found
+
+    def _redesignate_run_in(self, inst, doc, node, found) -> bool:
+        kind, old, new = inst.args["kind"], inst.args["old"], inst.args["new"]
+        for (text, match), value in reversed(list(zip(found, new))):
+            _swap(text, match.start(), match.end(), f"({value})", inst.cite)
+        labels = [f"({v})" for v in old]
+        names = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + f" and {labels[-1]}"
+        self._flag(inst.cite, f"The Code runs {kind}s {names} into the text of {_describe(node, doc)} rather than "
+                              "setting them out as provisions. They're redesignated there, in the text.",
+                   False, doc, node)
+        return True
+
+    def _reorder(self, inst, doc, node) -> bool:
+        """'By moving the paragraphs so as to appear in numerical order'."""
+        if self._move_into_order(node, inst.args["kind"], inst.cite) is None:
+            raise _NotApplied(f"Not applied: the {inst.args['kind']}s of {_describe(node, doc)} can't be put in "
+                              "order by their designations.", doc, node)
+        return True
+
+    def _move_into_order(self, node: Node, kind: str, source: str) -> bool | None:
+        """Put node's subdivisions of kind in numerical order, marking as moved the fewest original ones that
+        explain the new order. Returns whether any moved, or None if the designations can't be ordered."""
+        if self.undo is not None:
+            raise _NotApplied("Not applied: moving subdivisions in an instruction that names several places "
+                              "isn't supported.", None, node)
+        slots = [i for i, c in enumerate(node.children) if not c.deleted and c.kind == kind]
+        nodes = [node.children[i] for i in slots]
+        keys = _order_keys([n.value for n in nodes])
+        if keys is None:
+            return None
+        order = sorted(range(len(nodes)), key=lambda i: keys[i])
+        if order == list(range(len(nodes))):
+            return False
+        # The original subdivisions that stay put are the longest run already in order; the others moved.
+        # Subdivisions the bill adds are new text, not moved text.
+        originals = [i for i in range(len(nodes)) if nodes[i].before_text()]
+        staying = _longest_increasing([keys[i] for i in originals])
+        for position, i in enumerate(originals):
+            if position not in staying:
+                nodes[i].mark_moved(source)
+                nodes[i].moved_by = source
+        if node.original_order is None:
+            node.original_order = list(node.children)
+        for slot, i in zip(slots, order):
+            node.children[slot] = nodes[i]
         return True
 
     def _redesignate_sections(self, inst, act: Act) -> bool:
@@ -752,13 +1326,56 @@ class Engine:
             return self._not_redlined(inst, f"{target.name} wasn't found in the Code")
         last = self._direct(Target(title=target.title, usc_section=sections[-1]))
         for index, block in enumerate(inst.args["blocks"]):
-            number = block.value
-            block.label = Text(f"§ {number}.", INS, (inst.cite,))  # a Code section, not an Act's "Sec."
-            doc = Document(key=f"new:{target.title}usc{number}", title=f"New {target.title} U.S.C. § {number}",
+            asked = block.value
+            number = _next_free(asked, lambda n: title.document(n) is not None or f"new:{target.title}usc{n}" in self.docs)
+            block.value = number or asked
+            block.label = Text(f"§ {block.value}.", INS, (inst.cite,))  # a Code section, not an Act's "Sec."
+            doc = Document(key=f"new:{target.title}usc{block.value}",
+                           title=f"New {target.title} U.S.C. § {block.value}",
                            root=block, basis="new", order=(last.order[0], last.order[1], 2 + index))
-            if title.document(number) is not None or doc.key in self.docs:
-                self._flag(inst.cite, f"{target.title} U.S.C. § {number} already exists.", True, doc)
+            if number is None:
+                self._flag(inst.cite, f"{target.title} U.S.C. § {asked} already exists.", True, doc)
+            elif number != asked:
+                self._flag(inst.cite, f"{target.title} U.S.C. § {asked} already exists, so the new section is added "
+                                      f"as § {number}, the next number not in use. Check the numbering.", False, doc)
             self.docs[doc.key] = doc
+        return True
+
+    def _apply_toc(self, inst) -> bool:
+        """'The table of sections for chapter 3027 of title 54, United States Code, is amended by adding at the
+        end the following: 302707. Program evaluation.' Each new entry is checked against the chapter's
+        sections, including those the bill adds, which may have been added under another number."""
+        target = inst.target
+        title = self.titles.get(target.title)
+        entries = inst.args.get("blocks", [])
+        if inst.action != "add_at_end" or inst.path or not entries or any(b.kind != "toc-entry" for b in entries):
+            return self._not_redlined(inst, "only adding entries at the end of a chapter's table of sections is "
+                                            "supported")
+        found = title.chapter_toc(target.chapter) if title else None
+        if found is None:
+            return self._not_redlined(inst, f"{target.name} wasn't found in the Code")
+        doc = self.docs.setdefault(found.key, found)
+        existing = {c.value for c in doc.root.children if not c.deleted}
+        chapter = set(title.chapter_sections(target.chapter))
+        added = {d.root.value: d for d in self.docs.values()
+                 if d.basis == "new" and d.key.startswith(f"new:{target.title}usc")}
+        for entry in entries:
+            number = entry.value
+            if number in existing:
+                self._flag(inst.cite, f"The table of sections already lists § {number}.", False, doc, entry)
+            elif number in added:
+                if added[number].root.heading.current().rstrip(".") != entry.body.current().rstrip("."):
+                    self._flag(inst.cite, f"The new entry for § {number} reads “{entry.body.current()}”, but the "
+                                          f"new section's heading is “{added[number].root.heading.current()}”. Check "
+                                          "the entry.", False, doc, entry)
+            elif number in chapter:
+                self._flag(inst.cite, f"The table of sections gets an entry for § {number}, which the chapter "
+                                      "already has but the table didn't list.", False, doc, entry)
+            else:
+                self._flag(inst.cite, f"The new entry is for § {number}, but the chapter has no § {number} and the "
+                                      "bill doesn't add one under that number. A new section may have been added "
+                                      "under the next free number; check the entry.", False, doc, entry)
+        doc.root.children.extend(entries)
         return True
 
     def _add_sections_at_end(self, inst, act: Act) -> bool:
@@ -782,6 +1399,11 @@ class Engine:
         # A Public Law number identifies the Act exactly; older laws are better known by name.
         name = act.law if act.law.startswith("Pub. L.") else "the " + _act_name(inst.target.name)
         for index, block in enumerate(inst.args["blocks"]):
+            asked = block.value
+            number = _next_free(asked, lambda n: n in act.sections)
+            if number is not None and number != asked:
+                block.value = number
+                block.label = Text(f"Sec. {number}.", INS, (inst.cite,))
             number = block.value
             # After the previous section and its notes, and after any new sections already placed after it.
             order = ((previous.order[0], previous.order[1], max(previous.order[2], 1) + 1 + index) if previous
@@ -795,6 +1417,12 @@ class Engine:
             )
             if number in act.sections:
                 self._flag(inst.cite, f"Act § {number} already exists when this new section is added.", True, doc)
+            elif number != asked:
+                existing = act.sections[asked]
+                where = f" ({existing.title})" if existing.basis == "code" else ""
+                self._flag(inst.cite, f"Act § {asked} already exists{where}, so the new section is added as "
+                                      f"§ {number}, the next number not in use. Check the numbering, and any "
+                                      f"references to the new section as § {asked}.", False, doc)
             act.sections[number] = doc
             self.docs[doc.key] = doc
             self.units[doc.key] = unit
@@ -867,6 +1495,55 @@ def _walk_nodes(node: Node):
     yield node
     for child in node.children:
         yield from _walk_nodes(child)
+
+
+def _container_for(block: Node, existing: list[Node]) -> Node | None:
+    """The deepest node along block's last-child chain whose last child is at the level of the existing
+    subdivisions, which then continue after it. None when there are none, they're at mixed levels, or no
+    level matches, as when they're at the block's own level and simply follow it."""
+    kinds = {c.kind for c in existing if not c.deleted and c.kind != "continuation"}
+    if len(kinds) != 1:
+        return None
+    kind = kinds.pop()
+    found, node = None, block
+    while node.children:
+        if node.children[-1].kind == kind:
+            found = node
+        node = node.children[-1]
+    return found
+
+
+def _next_free(number: str, taken) -> str | None:
+    """number, or the next higher whole number not taken when it is. None when it's taken and isn't a plain
+    number, as with "216A", whose next number isn't clear."""
+    if not taken(number):
+        return number
+    if not number.isdigit():
+        return None
+    value = int(number) + 1
+    while taken(str(value)):
+        value += 1
+    return str(value)
+
+
+def _order_keys(values: list[str]) -> list[int] | None:
+    """Sort keys for designations all in one style: numbers, single letters or roman numerals."""
+    if all(v.isdigit() for v in values):
+        return [int(v) for v in values]
+    if all(len(v) == 1 and v.isalpha() for v in values):
+        return [ord(v) for v in values]
+    if all(v.lower() in _ROMANS for v in values):
+        return [_ROMANS.index(v.lower()) for v in values]
+    return None
+
+
+def _longest_increasing(keys: list[int]) -> set[int]:
+    """Positions of a longest strictly increasing subsequence of keys."""
+    best: list[list[int]] = []
+    for i, key in enumerate(keys):
+        chain = max((b for j, b in enumerate(best) if keys[j] < key), key=len, default=[])
+        best.append(chain + [i])
+    return set(max(best, key=len, default=[]))
 
 
 def _describe(node: Node, doc: Document) -> str:

@@ -529,7 +529,7 @@ class Engine:
         windows = [(t, 0, len(t.current())) for t in node.texts(headings=False) if t.current()]
         for part in inst.within:
             if part[0] == "sentence":
-                base = self._sentence_base(windows, part[1], doc, node)
+                base = self._sentence_base(windows, part[1], doc, node, inst)
                 try:
                     windows = [self._sentence(base, part[1], doc, node)]
                 except _NotApplied:
@@ -568,13 +568,18 @@ class Engine:
         following = [s for t, s, _ in starts if t is text and s > begin]
         return text, begin, following[0] if following else end
 
-    def _sentence_base(self, windows, n, doc, node) -> tuple[Text, int, int]:
+    def _sentence_base(self, windows, n, doc, node, inst=None) -> tuple[Text, int, int]:
         """The window that sentence n is counted in. With subdivisions, that's the introductory text, which
-        comes first, so it's only clear when the count stays within it."""
+        comes first, so it's only clear when the count stays within it, or when the quoted text is only there:
+        the Code may join the Act's sentences, so it has fewer than the bill counts (see _sentence_by_text)."""
         if len(windows) == 1:
             return windows[0]
         body = node.body.current()
         if n > 0 and body and len(_sentences(body)) >= n:
+            return (node.body, 0, len(body))
+        phrase = inst and (inst.args.get("old") or inst.args.get("start"))
+        hits = self._hits(phrase, windows) if phrase and n > 0 and body else []
+        if hits and all(text is node.body for text, _ in hits):
             return (node.body, 0, len(body))
         raise _NotApplied(f"Not applied: {_describe(node, doc)} has subdivisions, so it isn't clear which text "
                           "the sentence count starts from.", doc, node)

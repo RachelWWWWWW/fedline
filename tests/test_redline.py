@@ -1172,6 +1172,33 @@ class BlockTests(unittest.TestCase):
                                         args={"old": "gilsonite", "new": "", "every": False, "except": None},
                                         within=[("sentence", 3)]), doc, node)
 
+    def test_a_joined_sentence_is_found_in_the_introductory_text_once_there_are_subdivisions(self):
+        # S. 5653 § 2215(c)(1)(B): after (A) splits off paragraph (5), "Lease" is in the Code's fourth sentence,
+        # which the bill counts as the fifth.
+        def section():
+            return Node("section", "351", label=Text("§ 351."), body=Text(
+                "“Secretary” means the Secretary, “Mineral leasing laws” shall mean the Act. "
+                "“Lease” includes “prospecting permit”."),
+                children=[new_node("paragraph", "5", "Oil", "The term “oil” means oil.")])
+
+        def apply(node):
+            engine = Engine(SimpleNamespace(), {})
+            engine._operate(Instruction(
+                cite="§ 9", raw="", target=Target(), path=[], action="replace_with_block",
+                args={"old": "“Lease”", "blocks": [new_node("paragraph", "3", "Lease", "The term “lease”")]},
+                within=[("sentence", 3)]), SimpleNamespace(title="Test", root=node), node)
+            return engine
+
+        node = section()
+        engine = apply(node)
+        self.assertEqual([c.value for c in node.children], ["3", "5"])
+        self.assertEqual(marked(node.children[0].body), "[+The term “lease”+] includes “prospecting permit”.")
+        self.assertIn("the second sentence", engine.reworded[0][0])
+        node = section()
+        node.children[0].body = Text("The term “oil” means oil. “Lease” has its own meaning.")
+        with self.assertRaises(_NotApplied):  # the quoted text is in a subdivision too
+            apply(node)
+
     def test_a_struck_span_needs_its_end(self):
         node = Node("section", "351", label=Text("§ 351."), body=Text("The term oil shall include all gases."))
         doc = SimpleNamespace(title="Test", root=node)

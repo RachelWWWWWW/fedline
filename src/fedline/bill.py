@@ -450,6 +450,12 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     if match:
         return "insert_after", {"new": q(match, "a"), "anchor": q(match, "b")}
 
+    # The anchor first, then the new text: 'by inserting after "uses that tower" the following: ", or in the
+    # case of …"' (S. 4322 § 601(a)).
+    match = re.fullmatch(r"by inserting (?P<where>after|before) ⟦(?P<b>\d+)⟧ the following:? ⟦(?P<a>\d+)⟧", text)
+    if match:
+        return f"insert_{match.group('where')}", {"new": q(match, "a"), "anchor": q(match, "b")}
+
     match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ before the period at the end", text)
     if match:
         return "insert_before_period", {"new": q(match, "a")}

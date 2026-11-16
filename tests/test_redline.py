@@ -911,6 +911,16 @@ class EachOfTests(unittest.TestCase):
             self.assertIn("Indentation only: the instruction moves paragraphs (1) through (3)",
                           outcome.flags[0].message)
 
+    def test_inserting_after_text_the_following_text(self):
+        # S. 4322 § 601(a): 'by inserting after "uses that tower" the following: ", or in the case of …"'.
+        for where, new, expected in (
+                ("after", ", or 10", "The Secretary shall report within 5 years[+, or 10+]."),
+                ("before", "about", "The Secretary shall report within [+about +]5 years.")):
+            outcome, texts = self.run_bill(f"in paragraph (2), by inserting {where} <quote>5 years</quote> the "
+                                           f"following: <quote>{new}</quote>.")
+            self.assertEqual((outcome.applied, outcome.flags), (1, []))
+            self.assertEqual(texts[1], expected)
+
     def test_moving_the_margins_of_the_provision_the_instruction_is_in(self):
         # S. 4322 §§ 201(a)(1)(A), 103(b)(1)(A)(ii).
         for wording in ("in paragraph (2), by adjusting the margins 2 ems to the left.",

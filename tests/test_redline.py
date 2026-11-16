@@ -656,6 +656,23 @@ class LeadInTests(unittest.TestCase):
         self.assertEqual((inst.target.name, inst.target.title, inst.target.usc_section), ("Federal Power Act", 16, "824p"))
         self.assertEqual((inst.action, inst.args["values"]), ("insert_after_node", ["216"]))
 
+    def test_the_following_new_subsection(self):
+        # S. 3301 § 2(b)(2): "by inserting after subsection (e) the following new subsection:".
+        bill = parse_sections("<section><enum>2.</enum><text>Section 9909 of the Foo Act (15 U.S.C. 4659) is amended "
+                              "by inserting after subsection (e) the following new subsection:</text><quoted-block>"
+                              "<subsection><enum>(f)</enum><header>New</header><text>Text.</text></subsection>"
+                              "</quoted-block></section>")
+        self.assertEqual(bill.problems, [])
+        inst = bill.instructions[0]
+        self.assertEqual((inst.action, inst.args["kind"], inst.args["values"]), ("insert_after_node", "subsection", ["e"]))
+
+    def test_the_following_new_kind_must_match_the_block(self):
+        bill = parse_sections("<section><enum>2.</enum><text>Section 9909 of the Foo Act (15 U.S.C. 4659) is amended "
+                              "by adding at the end the following new subsection:</text><quoted-block>"
+                              "<paragraph><enum>(3)</enum><text>Text.</text></paragraph></quoted-block></section>")
+        self.assertEqual(bill.instructions, [])
+        self.assertEqual(len(bill.problems), 1)
+
     def test_smaller_unit_before_the_section(self):
         target = self.target("Paragraph (4) of section 3101 of the Energy Act of 2020 (43 U.S.C. 3001) is amended")
         self.assertEqual((target.section, target.path, target.usc_section), ("3101", [("paragraph", "4")], "3001"))

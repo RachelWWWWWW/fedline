@@ -365,6 +365,12 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     text = re.sub(r"[;.,]?(?: and| or)?$", "", text).strip()
     q = lambda m, name: quotes[int(m.group(name))]
 
+    # "The following new subsection:" (S. 3301 § 2(b)(2)) says what the quoted block holds. Read it as "the
+    # following" when the block holds just that, so a bill whose words and block disagree is still flagged.
+    named = re.search(rf"\bthe following new ({_KINDS})(?=:?$)", text)
+    if named and blocks and all(b.kind == _LEVEL_WORDS[named.group(1)] for b in blocks):
+        text = text[:named.start()] + "the following" + text[named.end():]
+
     punct = "|".join(_PUNCTUATION)
     new = rf"(?:⟦(?P<b>\d+)⟧|a (?P<pb>{punct}))"
     new_text = lambda m: q(m, "b") if m.group("b") else _PUNCTUATION.get(m.group("pb") or "", "")

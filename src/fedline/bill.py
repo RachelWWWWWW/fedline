@@ -16,7 +16,9 @@ _WHERE = (r"(?:(?P<small>Subsection|Paragraph|Subparagraph|Clause|Subclause) (?P
 # A citation in parentheses, which may itself contain parentheses, as in "(42 U.S.C. 4332(2)(C))". A
 # parenthetical starting "as amended" or "as added" isn't a citation.
 _CITE = r"\((?!as )(?P<cite>(?:[^()]|\([^()]*\))+)\)"
-_AS_AMENDED = r"(?: \(as (?:amended|added|redesignated)(?:[^()]|\([^()]*\))*\)|, as amended by [^,]+,)?"
+# Also set off by commas, as in "(47 U.S.C. 613), as redesignated by section 102, is amended" (S. 4322 § 103(a)).
+_AS_AMENDED = (r"(?: \(as (?:amended|added|redesignated)(?:[^()]|\([^()]*\))*\)"
+               r"|, as (?:amended|added|redesignated) by [^,]+,)?")
 _LEAD = re.compile(
     rf"^{_WHERE}(?:the |The )?(?P<name>.+?) {_CITE}{_AS_AMENDED},? is (?:further )?amended{_AS_AMENDED}"
     r"(?P<rest>.*)$"

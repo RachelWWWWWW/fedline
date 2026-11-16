@@ -686,6 +686,13 @@ class LeadInTests(unittest.TestCase):
         self.assertEqual((target.name, target.usc_section),
                          ("Title I of the National Environmental Policy Act of 1969", "4336d"))
 
+    def test_as_redesignated_note_with_commas(self):
+        # S. 4322 § 103(a).
+        target = self.target("Subsection (g) of section 713 of the Communications Act of 1934 (47 U.S.C. 613), "
+                             "as redesignated by section 102, is amended")
+        self.assertEqual((target.name, target.cite, target.section, target.path),
+                         ("Communications Act of 1934", "47 U.S.C. 613", "713", [("subsection", "g")]))
+
     def test_code_chapter(self):
         target = self.target("Chapter 3027 of title 54, United States Code, is amended")
         self.assertEqual((target.title, target.chapter), (54, "3027"))

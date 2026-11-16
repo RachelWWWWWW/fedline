@@ -235,6 +235,51 @@ class RedesignateTests(unittest.TestCase):
         self.assertEqual([(c.kind, c.value) for c in root.children],
                          [("paragraph", "1"), ("paragraph", "2"), ("paragraph", "2A"), ("paragraph", "3")])
 
+    def test_a_designation_kept_only_as_repealed_is_reused_and_the_provision_moved_there(self):
+        # S. 4322 § 101(a): 47 U.S.C. 613(a) reads only "Repealed. Pub. L. 115–141, …". The bill redesignates
+        # subsection (h) as subsection (a), moves it before subsection (b), then amends paragraph (1) of it.
+        code = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>47</docNumber></meta><main>'
+                '<section identifier="/us/usc/t47/s613"><num value="613">§ 613.</num><heading>Access</heading>'
+                '<subsection><num value="a">(a)</num><heading> Repealed. Pub. L. 115–141, § 402(i)(11), Mar. 23, '
+                '2018</heading><content/></subsection><subsection><num value="b">(b)</num><content>Criteria.'
+                '</content></subsection><subsection><num value="h">(h)</num><heading>Definitions</heading>'
+                '<paragraph><num value="1">(1)</num><content>“video description” means a description.</content>'
+                '</paragraph></subsection><sourceCredit>(June 19, 1934, ch. 652, title VII, § 713, as added Pub. L. '
+                '104–104, title III, § 305, Feb. 8, 1996, 110 Stat. 126.)</sourceCredit></section></main></uscDoc>')
+        bill = parse_sections(
+            "<section><enum>101.</enum><text>Section 713 of the Communications Act of 1934 (47 U.S.C. 613) is "
+            "amended—</text><paragraph><enum>(1)</enum><text>by redesignating subsection (h) as subsection (a);"
+            "</text></paragraph><paragraph><enum>(2)</enum><text>by moving subsection (a), as so redesignated, so "
+            "that it appears immediately before subsection (b); and</text></paragraph><paragraph><enum>(3)</enum>"
+            "<text>in subsection (a), as so redesignated, in paragraph (1), by striking <quote>video</quote> and "
+            "inserting <quote>audio</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual(bill.instructions[1].args, {"kind": "subsection", "value": "a", "where": "before",
+                                                     "anchor": "b"})
+        outcome = apply_bill(bill, {47: CodeTitle(code.encode())})
+        self.assertEqual((outcome.applied, outcome.flags), (3, []))
+        root = find_doc(outcome, "47 U.S.C. § 613").root
+        placeholder, renamed, criteria = root.children
+        # The bill doesn't strike the placeholder, so it isn't marked struck; it's left out of the redline.
+        self.assertEqual((placeholder.deleted, placeholder.superseded_by), (True, "§ 101(1)"))
+        self.assertEqual(marked(placeholder.label), "(a)")
+        self.assertEqual((renamed.moved_by, criteria.value), ("§ 101(2)", "b"))
+        self.assertEqual(marked(renamed.label), "[-(h)-][+(a)+]")
+        self.assertEqual(marked(renamed.children[0].body), "[~“~][-video-][+audio+][~ description” means a description.~]")
+        passed = verify(bill, outcome)
+        self.assertIn("Original text in the redline matches the source XML in every section.", passed)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "is", passed)
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        paragraphs = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<w:p>.*?</w:p>", document)]
+        self.assertFalse(any("Repealed" in p for p in paragraphs))
+        self.assertIn("47 U.S.C. § 613(a) isn't shown. The Code keeps it only to note a repeal, and § 101(1) of "
+                      "the bill gives its designation to another subsection.", paragraphs)
+        # The new (a) comes first, then (b), then the old (h) where it was, shown as moved away.
+        labels = [p[:3] for p in paragraphs if p[:1] == "(" and p[1:2] in "abh"]
+        self.assertEqual(labels, ["(h)", "(b)", "(h)"])
+
     def test_moving_into_numerical_order_marks_the_fewest_provisions_moved(self):
         bill, outcome, root = self.run_bill(
             "<text>by redesignating subsections (a) through (c) as paragraphs (3), (1), and (2), respectively, and "

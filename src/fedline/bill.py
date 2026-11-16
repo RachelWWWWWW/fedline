@@ -523,6 +523,14 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     if match:
         return "reorder", {"kind": _LEVEL_WORDS[match.group(1)]}
 
+    # One provision moved next to another: "by moving subsection (a), as so redesignated, so that it appears
+    # immediately before subsection (b)" (S. 4322 § 101(a)(2)). The note is gone by now, leaving its comma.
+    match = re.fullmatch(rf"by moving ({kinds}) \((\w+)\),? so (?:that it appears|as to appear) immediately "
+                         rf"(before|after) ({kinds}) \((\w+)\)", text)
+    if match and _LEVEL_WORDS[match.group(1)] == _LEVEL_WORDS[match.group(4)]:
+        return "move_node", {"kind": _LEVEL_WORDS[match.group(1)], "value": match.group(2),
+                             "where": match.group(3), "anchor": match.group(5)}
+
     match = re.fullmatch(rf"by striking the ({_ORDINAL}) sentence and inserting the following:?", text)
     if match and blocks:
         return "replace_sentence_with_block", {"n": _ORDINALS[match.group(1)], "blocks": blocks, "lead": lead}

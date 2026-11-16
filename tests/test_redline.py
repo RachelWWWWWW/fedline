@@ -921,6 +921,16 @@ class EachOfTests(unittest.TestCase):
             self.assertEqual((outcome.applied, outcome.flags), (1, []))
             self.assertEqual(texts[1], expected)
 
+    def test_inserting_with_is_read_as_inserting_and_flagged(self):
+        # S. 4322 § 201(a)(3)(F): 'by striking "does not include" and inserting with "includes"'.
+        outcome, texts = self.run_bill("in paragraph (2), by striking <quote>5 years</quote> and inserting with "
+                                       "<quote>10 years</quote>.")
+        self.assertEqual((outcome.applied, outcome.failed), (1, 0))
+        self.assertEqual(texts[1], "The Secretary shall report within [-5 years-][+10 years+].")
+        self.assertEqual([f.blocking for f in outcome.flags], [False])
+        self.assertIn("The bill says “and inserting with” for “and inserting”. This looks like a drafting problem",
+                      outcome.flags[0].message)
+
     def test_moving_the_margins_of_the_provision_the_instruction_is_in(self):
         # S. 4322 §§ 201(a)(1)(A), 103(b)(1)(A)(ii).
         for wording in ("in paragraph (2), by adjusting the margins 2 ems to the left.",

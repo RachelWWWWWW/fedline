@@ -442,6 +442,10 @@ class Engine:
 
     def _operate(self, inst: Instruction, doc: Document, node: Node) -> bool:
         action, args = inst.action, inst.args
+        if args.get("slip"):
+            # Flagged only if the instruction applies, like a rewording of the Code's text.
+            self.reworded.append((f"The bill says {args['slip']}. This looks like a drafting problem in the "
+                                  "bill. Applied as if it said the latter.", False, doc, node))
         if action == "replace":
             if args["every"]:
                 return self._replace_every(inst, doc, node)

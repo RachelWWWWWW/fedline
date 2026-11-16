@@ -751,6 +751,12 @@ class _Parser:
         located, more_within, more_heading, rest = _parse_locators(rest.strip())
         blocks = _block_nodes(el, cite_text)
         rest, lead = _lead_text(el, rest, blocks)
+        # A slip in the bill's wording that leaves its meaning plain: 'by striking "does not include" and
+        # inserting with "includes"' (S. 4322 § 201(a)(3)(F)). It's read as written without the slip, and the
+        # engine flags it to review.
+        slip = re.search(r"\band inserting with (?=⟦\d+⟧)", rest)
+        if slip:
+            rest = rest[:slip.start()] + "and inserting " + rest[slip.end():]
         parsed = _parse_action(rest, quotes, blocks, lead)
         full = raw or rest
         for i, quote in enumerate(quotes):
@@ -759,6 +765,8 @@ class _Parser:
             self.bill.problems.append(ParseProblem(cite_text, full, "instruction wording isn't a recognized pattern"))
             return
         action, args = parsed
+        if slip:
+            args["slip"] = "“and inserting with” for “and inserting”"
         # Bills mark text quoted from a heading, even when the wording doesn't say "heading".
         tagged = el.find("text/quote/header-in-text") is not None
         self.bill.instructions.append(Instruction(

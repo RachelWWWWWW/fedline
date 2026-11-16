@@ -1027,6 +1027,21 @@ class ParserTests(unittest.TestCase):
         self.assertEqual([i.path for i in bill.instructions],
                          [[("subsection", "a")], [("subsection", "a"), ("paragraph", "1")]])
 
+    def test_as_so_redesignated_set_off_by_commas(self):
+        # S. 4322 §§ 101(a)(3), 201(a)(3)(F), 103(b)(2).
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended—</text>"
+            "<paragraph><enum>(1)</enum><text>in subsection (a), as so redesignated—</text><subparagraph><enum>(A)"
+            "</enum><text>by striking <quote>x</quote> and inserting <quote>y</quote>; and</text></subparagraph>"
+            "</paragraph><paragraph><enum>(2)</enum><text>in paragraph (8), as so redesignated, by striking "
+            "<quote>p</quote> and inserting <quote>q</quote>; and</text></paragraph><paragraph><enum>(3)</enum>"
+            "<text>in subsection (b)(1), as redesignated by section 101, by striking <quote>c</quote> and "
+            "inserting <quote>d</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual([i.path for i in bill.instructions],
+                         [[("subsection", "a")], [("paragraph", "8")], [("subsection", "b"), ("paragraph", "1")]])
+        self.assertEqual([i.action for i in bill.instructions], ["replace"] * 3)
+
     def test_lead_in_comma_before_the_action(self):
         bill = parse_sections(
             "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended, in subsection (b), "

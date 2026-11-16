@@ -196,7 +196,11 @@ def _parse_target(match: re.Match) -> Target | None:
 
 _LEVEL_WORDS = {f"{word}s": word for word in LEVELS} | {word: word for word in LEVELS}
 _KINDS = "|".join(_LEVEL_WORDS)
-_AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|designated|added|amended)(?:[^()]|\([^()]*\))*\)")
+# "(as so redesignated)", or the same note set off by commas: "in subsection (a), as so redesignated—", "in
+# paragraph (8), as so redesignated, by striking", "in subsection (a)(1), as redesignated by section 101—"
+# (S. 4322). The comma form must end where a locator does, so it can't swallow the operation.
+_AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|designated|added|amended)(?:[^()]|\([^()]*\))*\)"
+                      r"|, as (?:so )?(?:redesignated|designated|added|amended)(?: by [^,—]+?)?(?=, |—|$)")
 
 
 def _roman(n: int) -> str:

@@ -911,6 +911,24 @@ class EachOfTests(unittest.TestCase):
             self.assertIn("Indentation only: the instruction moves paragraphs (1) through (3)",
                           outcome.flags[0].message)
 
+    def test_moving_the_margins_of_the_provision_the_instruction_is_in(self):
+        # S. 4322 §§ 201(a)(1)(A), 103(b)(1)(A)(ii).
+        for wording in ("in paragraph (2), by adjusting the margins 2 ems to the left.",
+                        "in paragraph (2), by moving the left margin of that paragraph and each subparagraph, and "
+                        "clause therein 2 ems to the left."):
+            outcome, texts = self.run_bill(wording)
+            self.assertEqual((outcome.applied, outcome.failed), (1, 0))
+            self.assertIsNone(texts)  # no words changed
+            self.assertEqual([f.blocking for f in outcome.flags], [False])
+            self.assertIn("Indentation only: the instruction moves the margins of 16 U.S.C. § 824p, paragraph (2), "
+                          "without changing its words.",
+                          outcome.flags[0].message)
+
+    def test_moving_the_margins_of_the_wrong_kind_isnt_applied(self):
+        outcome, _ = self.run_bill("in paragraph (2), by moving the left margin of that subsection 2 ems to the left.")
+        self.assertEqual((outcome.applied, outcome.failed), (0, 1))
+        self.assertIn("isn't one", outcome.flags[0].message)
+
     def test_indenting_a_missing_subdivision_isnt_applied(self):
         outcome, _ = self.run_bill("by indenting paragraphs (1) through (4) appropriately.")
         self.assertEqual((outcome.applied, outcome.failed), (0, 1))

@@ -483,6 +483,18 @@ class Engine:
             # The words don't change, and the redline indents each subdivision by its level, so there's
             # nothing to mark. The subdivisions are still checked, so a wrong reference isn't counted.
             values = args["values"]
+            if not values:
+                # The provision the instruction is in, as in "in subsection (u)— by adjusting the margins".
+                if args["kind"] and node.kind != args["kind"]:
+                    raise _NotApplied(f"Not applied: the bill moves the margins of a {args['kind']}, but "
+                                      f"{_describe(node, doc)} isn't one.", doc, node)
+                if node is doc.root:
+                    raise _NotApplied("Not applied: the instruction doesn't say which provision's margins move.",
+                                      doc, node)
+                self._flag(inst.cite, f"Indentation only: the instruction moves the margins of "
+                                      f"{_describe(node, doc)}, without changing its words. The redline sets "
+                                      "indentation by level, so no change is shown.", False, doc, node)
+                return True
             self._children(inst, doc, node, values, args["kind"])
             names = f"{args['kind']}s ({values[0]}) through ({values[-1]})" if len(values) > 1 \
                 else f"{args['kind']} ({values[0]})"

@@ -511,6 +511,15 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
         if values:
             return "indent", {"kind": kind, "values": values}
 
+    # The same, for the provision the instruction is in: "in subsection (u)— (A) by adjusting the margins 2 ems
+    # to the left" (S. 4322 § 201(a)(1)(A)), or "by moving the left margin of that subsection and each
+    # paragraph, subparagraph, and clause therein 2 ems to the left" (§ 103(b)(1)(A)(ii)).
+    match = re.fullmatch(
+        rf"by (?:adjusting|moving) the (?:left )?margins? (?:of (?:that|such|the) ({kinds})(?: and (?:each|every|all) "
+        r"[^.]*? (?:therein|thereof|in it))? )?\d+ ems? to the (?:right|left)", text)
+    if match:
+        return "indent", {"kind": _LEVEL_WORDS[match.group(1)] if match.group(1) else "", "values": []}
+
     # Only designations, so trailing words such as "and moving the paragraphs so as to appear in numerical
     # order" are read rather than swallowed.
     designations = r"(?:\(\w+\)|\d+\w*)(?:(?:,? and |, | through )(?:\(\w+\)|\d+\w*))*"

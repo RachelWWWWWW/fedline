@@ -16,7 +16,9 @@ _WHERE = (r"(?:(?P<small>Subsection|Paragraph|Subparagraph|Clause|Subclause) (?P
 # A citation in parentheses, which may itself contain parentheses, as in "(42 U.S.C. 4332(2)(C))". A
 # parenthetical starting "as amended" or "as added" isn't a citation.
 _CITE = r"\((?!as )(?P<cite>(?:[^()]|\([^()]*\))+)\)"
-_AS_AMENDED = r"(?: \(as (?:amended|added|redesignated)(?:[^()]|\([^()]*\))*\)|, as amended by [^,]+,)?"
+# Also set off by commas, as in "(47 U.S.C. 613), as redesignated by section 102, is amended" (S. 4322 § 103(a)).
+_AS_AMENDED = (r"(?: \(as (?:amended|added|redesignated)(?:[^()]|\([^()]*\))*\)"
+               r"|, as (?:amended|added|redesignated) by [^,]+,)?")
 _LEAD = re.compile(
     rf"^{_WHERE}(?:the |The )?(?P<name>.+?) {_CITE}{_AS_AMENDED},? is (?:further )?amended{_AS_AMENDED}"
     r"(?P<rest>.*)$"
@@ -194,7 +196,11 @@ def _parse_target(match: re.Match) -> Target | None:
 
 _LEVEL_WORDS = {f"{word}s": word for word in LEVELS} | {word: word for word in LEVELS}
 _KINDS = "|".join(_LEVEL_WORDS)
-_AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|designated|added|amended)(?:[^()]|\([^()]*\))*\)")
+# "(as so redesignated)", or the same note set off by commas: "in subsection (a), as so redesignated—", "in
+# paragraph (8), as so redesignated, by striking", "in subsection (a)(1), as redesignated by section 101—"
+# (S. 4322). The comma form must end where a locator does, so it can't swallow the operation.
+_AS_NOTE = re.compile(r" \(as (?:so )?(?:redesignated|designated|added|amended)(?:[^()]|\([^()]*\))*\)"
+                      r"|, as (?:so )?(?:redesignated|designated|added|amended)(?: by [^,—]+?)?(?=, |—|$)")
 
 
 def _roman(n: int) -> str:
@@ -309,12 +315,20 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
 _SECTION_CITED = re.compile(rf"^in (?:section (?P<section>\w+)|the (?P<first>first) section)(?P<path>(?:\(\w+\))*) "
                             rf"{_CITE}(?:, |—|$)")
 
+# "In title III (47 U.S.C. 301 et seq.)—" under a lead-in that names the whole Act (S. 4322 § 103(b)(1)) only
+# narrows where the instructions below it are. Each names its own section, as in "in section 303(u) (47 U.S.C.
+# 303(u))—", so it's passed over.
+_DIVISION_CITED = re.compile(rf"^in (?:title|subtitle|part|chapter|subchapter) \w+ {_CITE}(?:—|$)")
+
 
 def _locate_section(target: Target, text: str) -> tuple[Target, str]:
     """Handle "in section 1412(b)(2) (50 U.S.C. 98b note)," under a lead-in that names the Act without a
     section, as in "The … Act (Public Law 118–159) is amended—". Each instruction then gets its own section,
     and its own Code citation when the Act was cited only by Public Law or the Statutes at Large, so the right
     title is searched. "In the first section (62 Stat. 17, chapter 45; 25 U.S.C. 323)" is section 1."""
+    match = _DIVISION_CITED.match(text)
+    if match and not target.section and match.group("cite").endswith("et seq."):
+        return target, text[match.end():]
     match = _SECTION_CITED.match(text)
     if not match or target.section or target.chapter or target.name.startswith("title "):
         return target, text
@@ -365,12 +379,18 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     text = re.sub(r"[;.,]?(?: and| or)?$", "", text).strip()
     q = lambda m, name: quotes[int(m.group(name))]
 
+    # "The following new subsection:" (S. 3301 § 2(b)(2)) says what the quoted block holds. Read it as "the
+    # following" when the block holds just that, so a bill whose words and block disagree is still flagged.
+    named = re.search(rf"\bthe following new ({_KINDS})(?=:?$)", text)
+    if named and blocks and all(b.kind == _LEVEL_WORDS[named.group(1)] for b in blocks):
+        text = text[:named.start()] + "the following" + text[named.end():]
+
     punct = "|".join(_PUNCTUATION)
     new = rf"(?:⟦(?P<b>\d+)⟧|a (?P<pb>{punct}))"
     new_text = lambda m: q(m, "b") if m.group("b") else _PUNCTUATION.get(m.group("pb") or "", "")
 
     match = re.fullmatch(
-        r"by striking ⟦(?P<a>\d+)⟧(?P<every> each place (?:it|such term) appears?)?"
+        r"by striking ⟦(?P<a>\d+)⟧(?P<every> each place (?:it|such term|the term) appears?)?"
         rf"(?: \(except in section (?P<ex>\w+)\))?(?: and inserting {new})?", text)
     if match:
         return "replace", {"old": q(match, "a"), "new": new_text(match),
@@ -429,6 +449,12 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ after ⟦(?P<b>\d+)⟧", text)
     if match:
         return "insert_after", {"new": q(match, "a"), "anchor": q(match, "b")}
+
+    # The anchor first, then the new text: 'by inserting after "uses that tower" the following: ", or in the
+    # case of …"' (S. 4322 § 601(a)).
+    match = re.fullmatch(r"by inserting (?P<where>after|before) ⟦(?P<b>\d+)⟧ the following:? ⟦(?P<a>\d+)⟧", text)
+    if match:
+        return f"insert_{match.group('where')}", {"new": q(match, "a"), "anchor": q(match, "b")}
 
     match = re.fullmatch(r"by inserting ⟦(?P<a>\d+)⟧ before the period at the end", text)
     if match:
@@ -491,6 +517,15 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
         if values:
             return "indent", {"kind": kind, "values": values}
 
+    # The same, for the provision the instruction is in: "in subsection (u)— (A) by adjusting the margins 2 ems
+    # to the left" (S. 4322 § 201(a)(1)(A)), or "by moving the left margin of that subsection and each
+    # paragraph, subparagraph, and clause therein 2 ems to the left" (§ 103(b)(1)(A)(ii)).
+    match = re.fullmatch(
+        rf"by (?:adjusting|moving) the (?:left )?margins? (?:of (?:that|such|the) ({kinds})(?: and (?:each|every|all) "
+        r"[^.]*? (?:therein|thereof|in it))? )?\d+ ems? to the (?:right|left)", text)
+    if match:
+        return "indent", {"kind": _LEVEL_WORDS[match.group(1)] if match.group(1) else "", "values": []}
+
     # Only designations, so trailing words such as "and moving the paragraphs so as to appear in numerical
     # order" are read rather than swallowed.
     designations = r"(?:\(\w+\)|\d+\w*)(?:(?:,? and |, | through )(?:\(\w+\)|\d+\w*))*"
@@ -510,6 +545,14 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     match = re.fullmatch(rf"by moving the ({kinds}) so as to appear in numerical order", text)
     if match:
         return "reorder", {"kind": _LEVEL_WORDS[match.group(1)]}
+
+    # One provision moved next to another: "by moving subsection (a), as so redesignated, so that it appears
+    # immediately before subsection (b)" (S. 4322 § 101(a)(2)). The note is gone by now, leaving its comma.
+    match = re.fullmatch(rf"by moving ({kinds}) \((\w+)\),? so (?:that it appears|as to appear) immediately "
+                         rf"(before|after) ({kinds}) \((\w+)\)", text)
+    if match and _LEVEL_WORDS[match.group(1)] == _LEVEL_WORDS[match.group(4)]:
+        return "move_node", {"kind": _LEVEL_WORDS[match.group(1)], "value": match.group(2),
+                             "where": match.group(3), "anchor": match.group(5)}
 
     match = re.fullmatch(rf"by striking the ({_ORDINAL}) sentence and inserting the following:?", text)
     if match and blocks:
@@ -708,6 +751,12 @@ class _Parser:
         located, more_within, more_heading, rest = _parse_locators(rest.strip())
         blocks = _block_nodes(el, cite_text)
         rest, lead = _lead_text(el, rest, blocks)
+        # A slip in the bill's wording that leaves its meaning plain: 'by striking "does not include" and
+        # inserting with "includes"' (S. 4322 § 201(a)(3)(F)). It's read as written without the slip, and the
+        # engine flags it to review.
+        slip = re.search(r"\band inserting with (?=⟦\d+⟧)", rest)
+        if slip:
+            rest = rest[:slip.start()] + "and inserting " + rest[slip.end():]
         parsed = _parse_action(rest, quotes, blocks, lead)
         full = raw or rest
         for i, quote in enumerate(quotes):
@@ -716,6 +765,8 @@ class _Parser:
             self.bill.problems.append(ParseProblem(cite_text, full, "instruction wording isn't a recognized pattern"))
             return
         action, args = parsed
+        if slip:
+            args["slip"] = "“and inserting with” for “and inserting”"
         # Bills mark text quoted from a heading, even when the wording doesn't say "heading".
         tagged = el.find("text/quote/header-in-text") is not None
         self.bill.instructions.append(Instruction(

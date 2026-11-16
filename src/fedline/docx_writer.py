@@ -260,6 +260,11 @@ class Writer:
         if any(d.basis == "note" for d in o.documents):
             out.append(_para(_run("Redlines marked as based on a Code note use the text printed in the Code's "
                                   "notes, which may be incomplete or out of date.")))
+        for doc in o.documents:
+            for where, node in _superseded(doc.root):
+                out.append(_para(_run(f"{doc.title}{where} isn't shown. The Code keeps it only to note a repeal, "
+                                      f"and {node.superseded_by} of the bill gives its designation to another "
+                                      f"{node.kind}.")))
         out.append(_para(_run("Verification"), "Heading2"))
         out.extend(_para(_run(p), "ListBullet") for p in passed)
         if blocking:
@@ -334,15 +339,30 @@ class Writer:
         return _SECTION_BREAK.join(blocks) + _PAGE_SETUP
 
 
+def _superseded(node: Node, where: str = ""):
+    """Placeholders left out of the redline because the bill gave their designations to other provisions,
+    as (where, node), where is like "(a)" or "(b)(2)"."""
+    for child in node.children:
+        if child.kind == "continuation":
+            continue
+        here = f"{where}({child.value})" if child.value else where
+        if child.superseded_by:
+            yield here, child
+        else:
+            yield from _superseded(child, here)
+
+
 def _display_order(node: Node) -> list[tuple[Node, bool]]:
     """node's children in order, each with whether it's the old place of a moved one. Old places go just
     before the first child that didn't move and followed them in the original order."""
     if node.original_order is None:
-        return [(c, False) for c in node.children]
+        return [(c, False) for c in node.children if not c.superseded_by]
     original = {id(c): i for i, c in enumerate(node.original_order)}
     ghosts = [c for c in node.original_order if c.moved_by]
     out: list[tuple[Node, bool]] = []
     for child in node.children:
+        if child.superseded_by:
+            continue
         if id(child) in original and not child.moved_by:
             while ghosts and original[id(ghosts[0])] < original[id(child)]:
                 out.append((ghosts.pop(0), True))

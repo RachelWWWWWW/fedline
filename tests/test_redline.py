@@ -235,6 +235,51 @@ class RedesignateTests(unittest.TestCase):
         self.assertEqual([(c.kind, c.value) for c in root.children],
                          [("paragraph", "1"), ("paragraph", "2"), ("paragraph", "2A"), ("paragraph", "3")])
 
+    def test_a_designation_kept_only_as_repealed_is_reused_and_the_provision_moved_there(self):
+        # S. 4322 § 101(a): 47 U.S.C. 613(a) reads only "Repealed. Pub. L. 115–141, …". The bill redesignates
+        # subsection (h) as subsection (a), moves it before subsection (b), then amends paragraph (1) of it.
+        code = ('<uscDoc xmlns="http://xml.house.gov/schemas/uslm/1.0"><meta><docNumber>47</docNumber></meta><main>'
+                '<section identifier="/us/usc/t47/s613"><num value="613">§ 613.</num><heading>Access</heading>'
+                '<subsection><num value="a">(a)</num><heading> Repealed. Pub. L. 115–141, § 402(i)(11), Mar. 23, '
+                '2018</heading><content/></subsection><subsection><num value="b">(b)</num><content>Criteria.'
+                '</content></subsection><subsection><num value="h">(h)</num><heading>Definitions</heading>'
+                '<paragraph><num value="1">(1)</num><content>“video description” means a description.</content>'
+                '</paragraph></subsection><sourceCredit>(June 19, 1934, ch. 652, title VII, § 713, as added Pub. L. '
+                '104–104, title III, § 305, Feb. 8, 1996, 110 Stat. 126.)</sourceCredit></section></main></uscDoc>')
+        bill = parse_sections(
+            "<section><enum>101.</enum><text>Section 713 of the Communications Act of 1934 (47 U.S.C. 613) is "
+            "amended—</text><paragraph><enum>(1)</enum><text>by redesignating subsection (h) as subsection (a);"
+            "</text></paragraph><paragraph><enum>(2)</enum><text>by moving subsection (a), as so redesignated, so "
+            "that it appears immediately before subsection (b); and</text></paragraph><paragraph><enum>(3)</enum>"
+            "<text>in subsection (a), as so redesignated, in paragraph (1), by striking <quote>video</quote> and "
+            "inserting <quote>audio</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual(bill.instructions[1].args, {"kind": "subsection", "value": "a", "where": "before",
+                                                     "anchor": "b"})
+        outcome = apply_bill(bill, {47: CodeTitle(code.encode())})
+        self.assertEqual((outcome.applied, outcome.flags), (3, []))
+        root = find_doc(outcome, "47 U.S.C. § 613").root
+        placeholder, renamed, criteria = root.children
+        # The bill doesn't strike the placeholder, so it isn't marked struck; it's left out of the redline.
+        self.assertEqual((placeholder.deleted, placeholder.superseded_by), (True, "§ 101(1)"))
+        self.assertEqual(marked(placeholder.label), "(a)")
+        self.assertEqual((renamed.moved_by, criteria.value), ("§ 101(2)", "b"))
+        self.assertEqual(marked(renamed.label), "[-(h)-][+(a)+]")
+        self.assertEqual(marked(renamed.children[0].body), "[~“~][-video-][+audio+][~ description” means a description.~]")
+        passed = verify(bill, outcome)
+        self.assertIn("Original text in the redline matches the source XML in every section.", passed)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.docx")
+            write_docx(path, bill, outcome, "https://example.gov", "is", passed)
+            document = zipfile.ZipFile(path).read("word/document.xml").decode()
+        paragraphs = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<w:p>.*?</w:p>", document)]
+        self.assertFalse(any("Repealed" in p for p in paragraphs))
+        self.assertIn("47 U.S.C. § 613(a) isn't shown. The Code keeps it only to note a repeal, and § 101(1) of "
+                      "the bill gives its designation to another subsection.", paragraphs)
+        # The new (a) comes first, then (b), then the old (h) where it was, shown as moved away.
+        labels = [p[:3] for p in paragraphs if p[:1] == "(" and p[1:2] in "abh"]
+        self.assertEqual(labels, ["(h)", "(b)", "(h)"])
+
     def test_moving_into_numerical_order_marks_the_fewest_provisions_moved(self):
         bill, outcome, root = self.run_bill(
             "<text>by redesignating subsections (a) through (c) as paragraphs (3), (1), and (2), respectively, and "
@@ -656,6 +701,23 @@ class LeadInTests(unittest.TestCase):
         self.assertEqual((inst.target.name, inst.target.title, inst.target.usc_section), ("Federal Power Act", 16, "824p"))
         self.assertEqual((inst.action, inst.args["values"]), ("insert_after_node", ["216"]))
 
+    def test_the_following_new_subsection(self):
+        # S. 3301 § 2(b)(2): "by inserting after subsection (e) the following new subsection:".
+        bill = parse_sections("<section><enum>2.</enum><text>Section 9909 of the Foo Act (15 U.S.C. 4659) is amended "
+                              "by inserting after subsection (e) the following new subsection:</text><quoted-block>"
+                              "<subsection><enum>(f)</enum><header>New</header><text>Text.</text></subsection>"
+                              "</quoted-block></section>")
+        self.assertEqual(bill.problems, [])
+        inst = bill.instructions[0]
+        self.assertEqual((inst.action, inst.args["kind"], inst.args["values"]), ("insert_after_node", "subsection", ["e"]))
+
+    def test_the_following_new_kind_must_match_the_block(self):
+        bill = parse_sections("<section><enum>2.</enum><text>Section 9909 of the Foo Act (15 U.S.C. 4659) is amended "
+                              "by adding at the end the following new subsection:</text><quoted-block>"
+                              "<paragraph><enum>(3)</enum><text>Text.</text></paragraph></quoted-block></section>")
+        self.assertEqual(bill.instructions, [])
+        self.assertEqual(len(bill.problems), 1)
+
     def test_smaller_unit_before_the_section(self):
         target = self.target("Paragraph (4) of section 3101 of the Energy Act of 2020 (43 U.S.C. 3001) is amended")
         self.assertEqual((target.section, target.path, target.usc_section), ("3101", [("paragraph", "4")], "3001"))
@@ -668,6 +730,13 @@ class LeadInTests(unittest.TestCase):
                              "1102(b)(1)) is amended, in section 110 (42 U.S.C. 4336d),")
         self.assertEqual((target.name, target.usc_section),
                          ("Title I of the National Environmental Policy Act of 1969", "4336d"))
+
+    def test_as_redesignated_note_with_commas(self):
+        # S. 4322 § 103(a).
+        target = self.target("Subsection (g) of section 713 of the Communications Act of 1934 (47 U.S.C. 613), "
+                             "as redesignated by section 102, is amended")
+        self.assertEqual((target.name, target.cite, target.section, target.path),
+                         ("Communications Act of 1934", "47 U.S.C. 613", "713", [("subsection", "g")]))
 
     def test_code_chapter(self):
         target = self.target("Chapter 3027 of title 54, United States Code, is amended")
@@ -842,6 +911,44 @@ class EachOfTests(unittest.TestCase):
             self.assertIn("Indentation only: the instruction moves paragraphs (1) through (3)",
                           outcome.flags[0].message)
 
+    def test_inserting_after_text_the_following_text(self):
+        # S. 4322 § 601(a): 'by inserting after "uses that tower" the following: ", or in the case of …"'.
+        for where, new, expected in (
+                ("after", ", or 10", "The Secretary shall report within 5 years[+, or 10+]."),
+                ("before", "about", "The Secretary shall report within [+about +]5 years.")):
+            outcome, texts = self.run_bill(f"in paragraph (2), by inserting {where} <quote>5 years</quote> the "
+                                           f"following: <quote>{new}</quote>.")
+            self.assertEqual((outcome.applied, outcome.flags), (1, []))
+            self.assertEqual(texts[1], expected)
+
+    def test_inserting_with_is_read_as_inserting_and_flagged(self):
+        # S. 4322 § 201(a)(3)(F): 'by striking "does not include" and inserting with "includes"'.
+        outcome, texts = self.run_bill("in paragraph (2), by striking <quote>5 years</quote> and inserting with "
+                                       "<quote>10 years</quote>.")
+        self.assertEqual((outcome.applied, outcome.failed), (1, 0))
+        self.assertEqual(texts[1], "The Secretary shall report within [-5 years-][+10 years+].")
+        self.assertEqual([f.blocking for f in outcome.flags], [False])
+        self.assertIn("The bill says “and inserting with” for “and inserting”. This looks like a drafting problem",
+                      outcome.flags[0].message)
+
+    def test_moving_the_margins_of_the_provision_the_instruction_is_in(self):
+        # S. 4322 §§ 201(a)(1)(A), 103(b)(1)(A)(ii).
+        for wording in ("in paragraph (2), by adjusting the margins 2 ems to the left.",
+                        "in paragraph (2), by moving the left margin of that paragraph and each subparagraph, and "
+                        "clause therein 2 ems to the left."):
+            outcome, texts = self.run_bill(wording)
+            self.assertEqual((outcome.applied, outcome.failed), (1, 0))
+            self.assertIsNone(texts)  # no words changed
+            self.assertEqual([f.blocking for f in outcome.flags], [False])
+            self.assertIn("Indentation only: the instruction moves the margins of 16 U.S.C. § 824p, paragraph (2), "
+                          "without changing its words.",
+                          outcome.flags[0].message)
+
+    def test_moving_the_margins_of_the_wrong_kind_isnt_applied(self):
+        outcome, _ = self.run_bill("in paragraph (2), by moving the left margin of that subsection 2 ems to the left.")
+        self.assertEqual((outcome.applied, outcome.failed), (0, 1))
+        self.assertIn("isn't one", outcome.flags[0].message)
+
     def test_indenting_a_missing_subdivision_isnt_applied(self):
         outcome, _ = self.run_bill("by indenting paragraphs (1) through (4) appropriately.")
         self.assertEqual((outcome.applied, outcome.failed), (0, 1))
@@ -1002,6 +1109,35 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(bill.problems, [])
         self.assertEqual([i.path for i in bill.instructions],
                          [[("subsection", "a")], [("subsection", "a"), ("paragraph", "1")]])
+
+    def test_as_so_redesignated_set_off_by_commas(self):
+        # S. 4322 §§ 101(a)(3), 201(a)(3)(F), 103(b)(2).
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended—</text>"
+            "<paragraph><enum>(1)</enum><text>in subsection (a), as so redesignated—</text><subparagraph><enum>(A)"
+            "</enum><text>by striking <quote>x</quote> and inserting <quote>y</quote>; and</text></subparagraph>"
+            "</paragraph><paragraph><enum>(2)</enum><text>in paragraph (8), as so redesignated, by striking "
+            "<quote>p</quote> and inserting <quote>q</quote>; and</text></paragraph><paragraph><enum>(3)</enum>"
+            "<text>in subsection (b)(1), as redesignated by section 101, by striking <quote>c</quote> and "
+            "inserting <quote>d</quote>.</text></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        self.assertEqual([i.path for i in bill.instructions],
+                         [[("subsection", "a")], [("paragraph", "8")], [("subsection", "b"), ("paragraph", "1")]])
+        self.assertEqual([i.action for i in bill.instructions], ["replace"] * 3)
+
+    def test_a_title_locator_under_the_whole_act_passes_through(self):
+        # S. 4322 § 103(b)(1).
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>The Foo Act (47 U.S.C. 151 et seq.) is amended—</text><paragraph>"
+            "<enum>(1)</enum><text>in title III (47 U.S.C. 301 et seq.)—</text><subparagraph><enum>(A)</enum>"
+            "<text>in section 303(u) (47 U.S.C. 303(u)), by striking <quote>x</quote> and inserting "
+            "<quote>y</quote>; and</text></subparagraph><subparagraph><enum>(B)</enum><text>in section 330(b) "
+            "(47 U.S.C. 330(b)), by striking <quote>video</quote> each place the term appears and inserting "
+            "<quote>audio</quote>.</text></subparagraph></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        first, second = bill.instructions
+        self.assertEqual((first.target.section, first.target.path), ("303", [("subsection", "u")]))
+        self.assertEqual((second.target.section, second.action, second.args["every"]), ("330", "replace", True))
 
     def test_lead_in_comma_before_the_action(self):
         bill = parse_sections(

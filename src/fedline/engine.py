@@ -442,6 +442,10 @@ class Engine:
 
     def _operate(self, inst: Instruction, doc: Document, node: Node) -> bool:
         action, args = inst.action, inst.args
+        if args.get("slip"):
+            # Flagged only if the instruction applies, like a rewording of the Code's text.
+            self.reworded.append((f"The bill says {args['slip']}. This looks like a drafting problem in the "
+                                  "bill. Applied as if it said the latter.", False, doc, node))
         if action == "replace":
             if args["every"]:
                 return self._replace_every(inst, doc, node)
@@ -470,6 +474,8 @@ class Engine:
             return self._redesignate(inst, doc, node)
         if action == "reorder":
             return self._reorder(inst, doc, node)
+        if action == "move_node":
+            return self._move_node(inst, doc, node)
         if action == "insert_at_start":
             # "By inserting “The term” after the paragraph designation": the start of the provision's text.
             if node.kind != inst.args["unit"] or not node.body.current():
@@ -481,6 +487,18 @@ class Engine:
             # The words don't change, and the redline indents each subdivision by its level, so there's
             # nothing to mark. The subdivisions are still checked, so a wrong reference isn't counted.
             values = args["values"]
+            if not values:
+                # The provision the instruction is in, as in "in subsection (u)— by adjusting the margins".
+                if args["kind"] and node.kind != args["kind"]:
+                    raise _NotApplied(f"Not applied: the bill moves the margins of a {args['kind']}, but "
+                                      f"{_describe(node, doc)} isn't one.", doc, node)
+                if node is doc.root:
+                    raise _NotApplied("Not applied: the instruction doesn't say which provision's margins move.",
+                                      doc, node)
+                self._flag(inst.cite, f"Indentation only: the instruction moves the margins of "
+                                      f"{_describe(node, doc)}, without changing its words. The redline sets "
+                                      "indentation by level, so no change is shown.", False, doc, node)
+                return True
             self._children(inst, doc, node, values, args["kind"])
             names = f"{args['kind']}s ({values[0]}) through ({values[-1]})" if len(values) > 1 \
                 else f"{args['kind']} ({values[0]})"
@@ -1204,6 +1222,14 @@ class Engine:
                 return self._redesignate_run_in(inst, doc, node, found)
         targets = self._children(inst, doc, node, old, kind)
         new_kind = inst.args.get("new_kind", kind)
+        # A designation the Code keeps only as "(a) Repealed. Pub. L. …" is free for reuse, as in S. 4322
+        # § 101(a)(1), "by redesignating subsection (h) as subsection (a)". The bill doesn't strike the
+        # placeholder, so it's left out of the redline rather than shown struck, and the cover page says so.
+        # Marked deleted, it's no longer found, so the renamed subdivision is the only one so designated.
+        for value in new:
+            held = node.live_child(value, new_kind)
+            if held is not None and held not in targets and _is_repealed_placeholder(held):
+                held.deleted, held.superseded_by = True, inst.cite
         for child, value in zip(targets, new):
             child.renumber(value, inst.cite)
             # "Subsections (a) through (g) as paragraphs (8), (4), …" makes them paragraphs, which also sets
@@ -1251,6 +1277,31 @@ class Engine:
         if self._move_into_order(node, inst.args["kind"], inst.cite) is None:
             raise _NotApplied(f"Not applied: the {inst.args['kind']}s of {_describe(node, doc)} can't be put in "
                               "order by their designations.", doc, node)
+        return True
+
+    def _move_node(self, inst, doc, node) -> bool:
+        """'By moving subsection (a) so that it appears immediately before subsection (b)'. The provision is
+        shown where it goes and, struck, where it was, as when subdivisions are put in numerical order."""
+        if self.undo is not None:
+            raise _NotApplied("Not applied: moving subdivisions in an instruction that names several places "
+                              "isn't supported.", doc, node)
+        kind, args = inst.args["kind"], inst.args
+        moving = self._children(inst, doc, node, [args["value"]], kind)[0]
+        anchor = self._children(inst, doc, node, [args["anchor"]], kind)[0]
+        if moving is anchor:
+            raise _NotApplied(f"Not applied: the bill moves {kind} ({args['value']}) next to itself.", doc, node)
+        children = [c for c in node.children if c is not moving]
+        position = children.index(anchor) + (1 if args["where"] == "after" else 0)
+        if node.children.index(moving) == position:
+            return True  # already there
+        if node.original_order is None:
+            node.original_order = list(node.children)
+        # Text the bill adds isn't moved text, so only a provision with original text is marked.
+        if moving.before_text():
+            moving.mark_moved(inst.cite)
+            moving.moved_by = inst.cite
+        children.insert(position, moving)
+        node.children = children
         return True
 
     def _move_into_order(self, node: Node, kind: str, source: str) -> bool | None:
@@ -1480,15 +1531,23 @@ class _NotApplied(Exception):
 def _snapshot(root: Node) -> list:
     """Everything an edit can change in a document's tree, to put back with _restore."""
     copy = lambda text: [Segment(s.text, s.status, s.sources) for s in text.segments]
-    return [(n, list(n.children), n.deleted, n.value, [copy(t) for t in (n.label, n.heading, n.body, n.tail)])
-            for n in _walk_nodes(root)]
+    return [(n, list(n.children), n.deleted, n.superseded_by, n.value,
+             [copy(t) for t in (n.label, n.heading, n.body, n.tail)]) for n in _walk_nodes(root)]
 
 
 def _restore(state: list) -> None:
-    for node, children, deleted, value, texts in state:
-        node.children, node.deleted, node.value = children, deleted, value
+    for node, children, deleted, superseded_by, value, texts in state:
+        node.children, node.deleted, node.superseded_by, node.value = children, deleted, superseded_by, value
         for text, segments in zip((node.label, node.heading, node.body, node.tail), texts):
             text.segments = segments
+
+
+def _is_repealed_placeholder(node: Node) -> bool:
+    """A subdivision the Code keeps only to note its repeal: "(a) Repealed. Pub. L. 115–141, …", with the note
+    as its heading (47 U.S.C. 613(a)) or as its text (47 U.S.C. 393a(b)), and nothing below it."""
+    if any(c.kind != "continuation" and not c.deleted for c in node.children):
+        return False
+    return bool(re.match(r"\s*Repealed\b", node.heading.current() or node.body.current()))
 
 
 def _walk_nodes(node: Node):

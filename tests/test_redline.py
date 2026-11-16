@@ -1087,6 +1087,20 @@ class ParserTests(unittest.TestCase):
                          [[("subsection", "a")], [("paragraph", "8")], [("subsection", "b"), ("paragraph", "1")]])
         self.assertEqual([i.action for i in bill.instructions], ["replace"] * 3)
 
+    def test_a_title_locator_under_the_whole_act_passes_through(self):
+        # S. 4322 § 103(b)(1).
+        bill = parse_sections(
+            "<section><enum>2.</enum><text>The Foo Act (47 U.S.C. 151 et seq.) is amended—</text><paragraph>"
+            "<enum>(1)</enum><text>in title III (47 U.S.C. 301 et seq.)—</text><subparagraph><enum>(A)</enum>"
+            "<text>in section 303(u) (47 U.S.C. 303(u)), by striking <quote>x</quote> and inserting "
+            "<quote>y</quote>; and</text></subparagraph><subparagraph><enum>(B)</enum><text>in section 330(b) "
+            "(47 U.S.C. 330(b)), by striking <quote>video</quote> each place the term appears and inserting "
+            "<quote>audio</quote>.</text></subparagraph></paragraph></section>")
+        self.assertEqual(bill.problems, [])
+        first, second = bill.instructions
+        self.assertEqual((first.target.section, first.target.path), ("303", [("subsection", "u")]))
+        self.assertEqual((second.target.section, second.action, second.args["every"]), ("330", "replace", True))
+
     def test_lead_in_comma_before_the_action(self):
         bill = parse_sections(
             "<section><enum>2.</enum><text>Section 5 of the Foo Act (42 U.S.C. 100) is amended, in subsection (b), "

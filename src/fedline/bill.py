@@ -315,12 +315,20 @@ def _parse_locators(text: str) -> tuple[list[tuple[str, str]], list[tuple], bool
 _SECTION_CITED = re.compile(rf"^in (?:section (?P<section>\w+)|the (?P<first>first) section)(?P<path>(?:\(\w+\))*) "
                             rf"{_CITE}(?:, |—|$)")
 
+# "In title III (47 U.S.C. 301 et seq.)—" under a lead-in that names the whole Act (S. 4322 § 103(b)(1)) only
+# narrows where the instructions below it are. Each names its own section, as in "in section 303(u) (47 U.S.C.
+# 303(u))—", so it's passed over.
+_DIVISION_CITED = re.compile(rf"^in (?:title|subtitle|part|chapter|subchapter) \w+ {_CITE}(?:—|$)")
+
 
 def _locate_section(target: Target, text: str) -> tuple[Target, str]:
     """Handle "in section 1412(b)(2) (50 U.S.C. 98b note)," under a lead-in that names the Act without a
     section, as in "The … Act (Public Law 118–159) is amended—". Each instruction then gets its own section,
     and its own Code citation when the Act was cited only by Public Law or the Statutes at Large, so the right
     title is searched. "In the first section (62 Stat. 17, chapter 45; 25 U.S.C. 323)" is section 1."""
+    match = _DIVISION_CITED.match(text)
+    if match and not target.section and match.group("cite").endswith("et seq."):
+        return target, text[match.end():]
     match = _SECTION_CITED.match(text)
     if not match or target.section or target.chapter or target.name.startswith("title "):
         return target, text
@@ -382,7 +390,7 @@ def _parse_operation(text: str, quotes: list[str], blocks: list[Node], lead: str
     new_text = lambda m: q(m, "b") if m.group("b") else _PUNCTUATION.get(m.group("pb") or "", "")
 
     match = re.fullmatch(
-        r"by striking ⟦(?P<a>\d+)⟧(?P<every> each place (?:it|such term) appears?)?"
+        r"by striking ⟦(?P<a>\d+)⟧(?P<every> each place (?:it|such term|the term) appears?)?"
         rf"(?: \(except in section (?P<ex>\w+)\))?(?: and inserting {new})?", text)
     if match:
         return "replace", {"old": q(match, "a"), "new": new_text(match),
